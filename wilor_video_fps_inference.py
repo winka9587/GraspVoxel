@@ -483,7 +483,9 @@ def main():
                     ray_len=None,
                     fids=list(range(len(all_cam_t))),
                     verts_list_preflipped=all_verts,
-                    collect_segments=True                 # ★ 开启收集线段
+                    collect_segments=True,                 # ★ 开启收集线段
+                    twist_kp_indices=(13,14,15),     # 若你的 thumb 索引不同，请据实调整
+                    twist_deg=45.0          # 顺时针 45°（从根→尖看为顺时针）
                 )
                 from visualization.mano_joint_ray import build_forward_region_from_segments
                 # 2) 只沿射线“前向”扩张得到交互区域（不在手背方向扩张）

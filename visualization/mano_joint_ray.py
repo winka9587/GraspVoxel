@@ -11,6 +11,16 @@ def _rotx_deg(deg: float):
                      [0, s, c]], dtype=np.float64)
 
 
+def _mano_parent(kp_idx: int) -> int:
+    """
+    MANO 关节父子（0=腕；1..3=拇指，4..6=食指，7..9=中指，10..12=无名指，13..15=小指）
+    每根手指的首节点的父亲是 0，其余是各自上一个。
+    """
+    if kp_idx in (1,4,7,10,13):
+        return 0
+    return kp_idx - 1
+
+
 def _dense_regressor(J_regressor):
     try:
         Jr = J_regressor.coalesce().to_dense().cpu().numpy()
@@ -412,248 +422,249 @@ def _dense_regressor(J_regressor):
 #     return final.astype(np.uint8)
 
 
-def compute_mano_joint_rays_mano_overlay_single(
-    out, model,
-    img_w, img_h,
-    cam_t,
-    focal_length,
-    axis='y-',
-    is_right_n=1,
-    line_color=(0, 0, 255), thickness=2, alpha_value=1.0,
-    apply_x_flip=False, apply_rotx_180=False,
-    invert_x=False, invert_y=False,
-    ray_len=None, fid=0,
-    verts_preflipped=None,
-    collect_segments=False,   # ★ 新增：是否返回 2D 线段
-):
-    import numpy as np, cv2
+# hand 
+# def compute_mano_joint_rays_mano_overlay_single(
+#     out, model,
+#     img_w, img_h,
+#     cam_t,
+#     focal_length,
+#     axis='y-',
+#     is_right_n=1,
+#     line_color=(0, 0, 255), thickness=2, alpha_value=1.0,
+#     apply_x_flip=False, apply_rotx_180=False,
+#     invert_x=False, invert_y=False,
+#     ray_len=None, fid=0,
+#     verts_preflipped=None,
+#     collect_segments=False,   # ★ 新增：是否返回 2D 线段
+# ):
+#     import numpy as np, cv2
 
-    is_right = (int(is_right_n) == 1)
-    s = 1.0 if is_right else -1.0
+#     is_right = (int(is_right_n) == 1)
+#     s = 1.0 if is_right else -1.0
 
-    # 顶点（与 silhouette 一致：左手对 x 取反）
-    if verts_preflipped is not None:
-        verts = np.asarray(verts_preflipped, dtype=np.float64).copy()
-    else:
-        verts = out['pred_vertices'][fid].detach().cpu().numpy().astype(np.float64)
-        verts[:, 0] *= s
+#     # 顶点（与 silhouette 一致：左手对 x 取反）
+#     if verts_preflipped is not None:
+#         verts = np.asarray(verts_preflipped, dtype=np.float64).copy()
+#     else:
+#         verts = out['pred_vertices'][fid].detach().cpu().numpy().astype(np.float64)
+#         verts[:, 0] *= s
 
-    # 关节（单 mano）
-    Jr = _dense_regressor(model.mano.J_regressor)
-    joints = Jr @ verts
-    if joints.shape[0] < 16:
-        overlay = np.zeros((img_h, img_w, 4), np.uint8)
-        return (overlay, 0, []) if collect_segments else (overlay, 0)
+#     # 关节（单 mano）
+#     Jr = _dense_regressor(model.mano.J_regressor)
+#     joints = Jr @ verts
+#     if joints.shape[0] < 16:
+#         overlay = np.zeros((img_h, img_w, 4), np.uint8)
+#         return (overlay, 0, []) if collect_segments else (overlay, 0)
 
-    # 姿态旋转
-    g = out['pred_mano_params']['global_orient']
-    R_global = (g[fid, 0] if g.ndim == 4 else g[fid]).detach().cpu().numpy()
-    R_hand   = out['pred_mano_params']['hand_pose'][fid].detach().cpu().numpy()  # (15,3,3)
+#     # 姿态旋转
+#     g = out['pred_mano_params']['global_orient']
+#     R_global = (g[fid, 0] if g.ndim == 4 else g[fid]).detach().cpu().numpy()
+#     R_hand   = out['pred_mano_params']['hand_pose'][fid].detach().cpu().numpy()  # (15,3,3)
 
-    # 基轴
-    if isinstance(axis, str):
-        amap = {'x':[1,0,0],'y':[0,1,0],'z':[0,0,1],'x-':[-1,0,0],'y-':[0,-1,0],'z-':[0,0,-1]}
-        axis_vec = np.array(amap.get(axis.lower(), [0,-1,0]), dtype=np.float64)
-    else:
-        axis_vec = np.asarray(axis, dtype=np.float64)
-        axis_vec /= (np.linalg.norm(axis_vec) + 1e-12)
+#     # 基轴
+#     if isinstance(axis, str):
+#         amap = {'x':[1,0,0],'y':[0,1,0],'z':[0,0,1],'x-':[-1,0,0],'y-':[0,-1,0],'z-':[0,0,-1]}
+#         axis_vec = np.array(amap.get(axis.lower(), [0,-1,0]), dtype=np.float64)
+#     else:
+#         axis_vec = np.asarray(axis, dtype=np.float64)
+#         axis_vec /= (np.linalg.norm(axis_vec) + 1e-12)
 
-    # 左手镜像方向
-    S = np.diag([s, 1.0, 1.0])
+#     # 左手镜像方向
+#     S = np.diag([s, 1.0, 1.0])
 
-    # 生成射线（MANO 坐标）+ 记录关节索引
-    origins, directions, kp_list = [], [], []
-    for j_idx, kp_idx in enumerate(range(1, 16)):  # 1..15
-        if kp_idx >= joints.shape[0]: 
-            continue
-        d = R_global @ (R_hand[j_idx] @ axis_vec)
-        d = (S @ d)
-        nrm = np.linalg.norm(d)
-        if not np.isfinite(d).all() or nrm < 1e-8:
-            continue
-        origins.append(joints[kp_idx])
-        directions.append(d / nrm)
-        kp_list.append(kp_idx)
+#     # 生成射线（MANO 坐标）+ 记录关节索引
+#     origins, directions, kp_list = [], [], []
+#     for j_idx, kp_idx in enumerate(range(1, 16)):  # 1..15
+#         if kp_idx >= joints.shape[0]: 
+#             continue
+#         d = R_global @ (R_hand[j_idx] @ axis_vec)
+#         d = (S @ d)
+#         nrm = np.linalg.norm(d)
+#         if not np.isfinite(d).all() or nrm < 1e-8:
+#             continue
+#         origins.append(joints[kp_idx])
+#         directions.append(d / nrm)
+#         kp_list.append(kp_idx)
 
-    if not origins:
-        overlay = np.zeros((img_h, img_w, 4), np.uint8)
-        return (overlay, 0, []) if collect_segments else (overlay, 0)
+#     if not origins:
+#         overlay = np.zeros((img_h, img_w, 4), np.uint8)
+#         return (overlay, 0, []) if collect_segments else (overlay, 0)
 
-    O = np.asarray(origins, dtype=np.float64)
-    D = np.asarray(directions, dtype=np.float64)
-    kp_list = np.asarray(kp_list, dtype=np.int32)
+#     O = np.asarray(origins, dtype=np.float64)
+#     D = np.asarray(directions, dtype=np.float64)
+#     kp_list = np.asarray(kp_list, dtype=np.int32)
 
-    # rotx180 → +cam_t
-    if apply_rotx_180:
-        R180 = _rotx_deg(180.0)
-        O = (R180 @ O.T).T
-        D = (R180 @ D.T).T
+#     # rotx180 → +cam_t
+#     if apply_rotx_180:
+#         R180 = _rotx_deg(180.0)
+#         O = (R180 @ O.T).T
+#         D = (R180 @ D.T).T
 
-    cam_t = np.asarray(cam_t, dtype=np.float64).copy()
-    if apply_x_flip:
-        cam_t[0] *= -1.0
-    O_cam = O + cam_t
+#     cam_t = np.asarray(cam_t, dtype=np.float64).copy()
+#     if apply_x_flip:
+#         cam_t[0] *= -1.0
+#     O_cam = O + cam_t
 
-    # 自适应长度
-    V = verts.copy()
-    if apply_rotx_180:
-        V = (_rotx_deg(180.0) @ V.T).T
-    V_cam = V + cam_t
-    if ray_len is None:
-        bbox = V_cam.max(axis=0) - V_cam.min(axis=0)
-        L = 0.15 * float(np.max(bbox) if np.isfinite(bbox).all() else 1.0)
-    else:
-        L = float(ray_len)
+#     # 自适应长度
+#     V = verts.copy()
+#     if apply_rotx_180:
+#         V = (_rotx_deg(180.0) @ V.T).T
+#     V_cam = V + cam_t
+#     if ray_len is None:
+#         bbox = V_cam.max(axis=0) - V_cam.min(axis=0)
+#         L = 0.15 * float(np.max(bbox) if np.isfinite(bbox).all() else 1.0)
+#     else:
+#         L = float(ray_len)
 
-    P0 = O_cam
-    P1 = O_cam + D * L
+#     P0 = O_cam
+#     P1 = O_cam + D * L
 
-    # 针孔投影
-    fx = fy = float(focal_length)
-    cx, cy = img_w / 2.0, img_h / 2.0
-    def _proj(P):
-        z = P[:, 2]
-        valid = z > 1e-6
-        z_safe = np.where(valid, z, 1.0)
-        u = (P[:, 0] / z_safe) * fx + cx
-        v = (P[:, 1] / z_safe) * fy + cy
-        return np.stack([u, v], -1), valid
+#     # 针孔投影
+#     fx = fy = float(focal_length)
+#     cx, cy = img_w / 2.0, img_h / 2.0
+#     def _proj(P):
+#         z = P[:, 2]
+#         valid = z > 1e-6
+#         z_safe = np.where(valid, z, 1.0)
+#         u = (P[:, 0] / z_safe) * fx + cx
+#         v = (P[:, 1] / z_safe) * fy + cy
+#         return np.stack([u, v], -1), valid
 
-    uv0, m0 = _proj(P0)
-    uv1, m1 = _proj(P1)
-    mask = m0 & m1
+#     uv0, m0 = _proj(P0)
+#     uv1, m1 = _proj(P1)
+#     mask = m0 & m1
 
-    if invert_x:
-        uv0[:, 0] = 2 * cx - uv0[:, 0]; uv1[:, 0] = 2 * cx - uv1[:, 0]
-    if invert_y:
-        uv0[:, 1] = 2 * cy - uv0[:, 1]; uv1[:, 1] = 2 * cy - uv1[:, 1]
+#     if invert_x:
+#         uv0[:, 0] = 2 * cx - uv0[:, 0]; uv1[:, 0] = 2 * cx - uv1[:, 0]
+#     if invert_y:
+#         uv0[:, 1] = 2 * cy - uv0[:, 1]; uv1[:, 1] = 2 * cy - uv1[:, 1]
 
-    # 绘制 & 可选收集线段
-    overlay = np.zeros((img_h, img_w, 4), dtype=np.uint8)
-    draw_view = overlay[:, :, :3]
-    draw = draw_view if draw_view.flags['C_CONTIGUOUS'] else np.ascontiguousarray(draw_view)
+#     # 绘制 & 可选收集线段
+#     overlay = np.zeros((img_h, img_w, 4), dtype=np.uint8)
+#     draw_view = overlay[:, :, :3]
+#     draw = draw_view if draw_view.flags['C_CONTIGUOUS'] else np.ascontiguousarray(draw_view)
 
-    c = (int(line_color[0]), int(line_color[1]), int(line_color[2]))
-    cnt = 0
-    segments = [] if collect_segments else None
+#     c = (int(line_color[0]), int(line_color[1]), int(line_color[2]))
+#     cnt = 0
+#     segments = [] if collect_segments else None
 
-    # 仅遍历有效的 indices
-    valid_idx = np.where(mask)[0]
-    for idx in valid_idx:
-        x0, y0 = uv0[idx]; x1, y1 = uv1[idx]
-        if not np.isfinite([x0, y0, x1, y1]).all():
-            continue
+#     # 仅遍历有效的 indices
+#     valid_idx = np.where(mask)[0]
+#     for idx in valid_idx:
+#         x0, y0 = uv0[idx]; x1, y1 = uv1[idx]
+#         if not np.isfinite([x0, y0, x1, y1]).all():
+#             continue
 
-        if collect_segments:
-            segments.append({
-                'uv0': (float(x0), float(y0)),
-                'uv1': (float(x1), float(y1)),
-                'kp_idx': int(kp_list[idx]),  # 真实的 1..15
-                'hand_id': int(fid)
-            })
+#         if collect_segments:
+#             segments.append({
+#                 'uv0': (float(x0), float(y0)),
+#                 'uv1': (float(x1), float(y1)),
+#                 'kp_idx': int(kp_list[idx]),  # 真实的 1..15
+#                 'hand_id': int(fid)
+#             })
 
-        p0 = (int(round(x0)), int(round(y0)))
-        p1 = (int(round(x1)), int(round(y1)))
-        cv2.circle(draw, p0, radius=max(1, thickness+1), color=c, thickness=-1, lineType=cv2.LINE_AA)
-        cv2.arrowedLine(draw, p0, p1, c, thickness=thickness, tipLength=0.25, line_type=cv2.LINE_AA)
-        cnt += 1
+#         p0 = (int(round(x0)), int(round(y0)))
+#         p1 = (int(round(x1)), int(round(y1)))
+#         cv2.circle(draw, p0, radius=max(1, thickness+1), color=c, thickness=-1, lineType=cv2.LINE_AA)
+#         cv2.arrowedLine(draw, p0, p1, c, thickness=thickness, tipLength=0.25, line_type=cv2.LINE_AA)
+#         cnt += 1
 
-    if draw is not draw_view:
-        overlay[:, :, :3] = draw
-    cov = overlay[:, :, :3].max(axis=2, keepdims=True).astype(np.float32) / 255.0
-    overlay[:, :, :3] = np.where(cov > 0, 255, overlay[:, :, :3])
-    overlay[:, :, 3:4] = (cov * (alpha_value * 255)).astype(np.uint8)
+#     if draw is not draw_view:
+#         overlay[:, :, :3] = draw
+#     cov = overlay[:, :, :3].max(axis=2, keepdims=True).astype(np.float32) / 255.0
+#     overlay[:, :, :3] = np.where(cov > 0, 255, overlay[:, :, :3])
+#     overlay[:, :, 3:4] = (cov * (alpha_value * 255)).astype(np.uint8)
 
-    return (overlay, cnt, segments) if collect_segments else (overlay, cnt)
+#     return (overlay, cnt, segments) if collect_segments else (overlay, cnt)
 
 
-def compute_mano_joint_rays_mano_overlay_multi(
-    out, model,
-    img_w, img_h,
-    cam_t_list,
-    focal_length,
-    is_right_list,
-    axis='y-',
-    line_color=(0, 0, 255), thickness=2, alpha_value=1.0,
-    apply_x_flip=False, apply_rotx_180=False,
-    invert_x=False, invert_y=False,
-    ray_len=None,
-    fids=None,
-    verts_list_preflipped=None,
-    collect_segments=False      # ★ 新增
-):
-    import numpy as np
+# def compute_mano_joint_rays_mano_overlay_multi(
+#     out, model,
+#     img_w, img_h,
+#     cam_t_list,
+#     focal_length,
+#     is_right_list,
+#     axis='y-',
+#     line_color=(0, 0, 255), thickness=2, alpha_value=1.0,
+#     apply_x_flip=False, apply_rotx_180=False,
+#     invert_x=False, invert_y=False,
+#     ray_len=None,
+#     fids=None,
+#     verts_list_preflipped=None,
+#     collect_segments=False      # ★ 新增
+# ):
+#     import numpy as np
 
-    cam_t_list = np.asarray(cam_t_list, dtype=np.float64)
-    if cam_t_list.ndim == 1:
-        cam_t_list = cam_t_list.reshape(1, 3)
-    N = cam_t_list.shape[0]
+#     cam_t_list = np.asarray(cam_t_list, dtype=np.float64)
+#     if cam_t_list.ndim == 1:
+#         cam_t_list = cam_t_list.reshape(1, 3)
+#     N = cam_t_list.shape[0]
 
-    if isinstance(focal_length, (list, tuple, np.ndarray)):
-        focal_list = list(np.asarray(focal_length).reshape(-1))
-        if len(focal_list) == 1 and N > 1:
-            focal_list = focal_list * N
-    else:
-        focal_list = [float(focal_length)] * N
+#     if isinstance(focal_length, (list, tuple, np.ndarray)):
+#         focal_list = list(np.asarray(focal_length).reshape(-1))
+#         if len(focal_list) == 1 and N > 1:
+#             focal_list = focal_list * N
+#     else:
+#         focal_list = [float(focal_length)] * N
 
-    is_right_list = list(np.asarray(is_right_list).astype(int).reshape(-1))
-    if len(is_right_list) != N:
-        is_right_list = (is_right_list * N)[:N]
+#     is_right_list = list(np.asarray(is_right_list).astype(int).reshape(-1))
+#     if len(is_right_list) != N:
+#         is_right_list = (is_right_list * N)[:N]
 
-    if fids is None:
-        fids = list(range(N))
-    else:
-        fids = list(np.asarray(fids).astype(int).reshape(-1))
-        if len(fids) != N:
-            raise ValueError("fids 长度必须与手的数量一致")
+#     if fids is None:
+#         fids = list(range(N))
+#     else:
+#         fids = list(np.asarray(fids).astype(int).reshape(-1))
+#         if len(fids) != N:
+#             raise ValueError("fids 长度必须与手的数量一致")
 
-    if verts_list_preflipped is not None:
-        verts_list_preflipped = [np.asarray(v, dtype=np.float64) for v in verts_list_preflipped]
-        if len(verts_list_preflipped) != N:
-            raise ValueError("verts_list_preflipped 长度必须与手的数量一致")
+#     if verts_list_preflipped is not None:
+#         verts_list_preflipped = [np.asarray(v, dtype=np.float64) for v in verts_list_preflipped]
+#         if len(verts_list_preflipped) != N:
+#             raise ValueError("verts_list_preflipped 长度必须与手的数量一致")
 
-    acc = np.zeros((img_h, img_w, 4), dtype=np.float32)
-    total_cnt = 0
-    all_segments = [] if collect_segments else None
+#     acc = np.zeros((img_h, img_w, 4), dtype=np.float32)
+#     total_cnt = 0
+#     all_segments = [] if collect_segments else None
 
-    for i in range(N):
-        verts_i = None if verts_list_preflipped is None else verts_list_preflipped[i]
-        if collect_segments:
-            ov_i, cnt_i, seg_i = compute_mano_joint_rays_mano_overlay_single(
-                out, model,
-                img_w, img_h,
-                cam_t=cam_t_list[i],
-                focal_length=focal_list[i],
-                axis=axis,
-                is_right_n=is_right_list[i],
-                line_color=line_color, thickness=thickness, alpha_value=alpha_value,
-                apply_x_flip=apply_x_flip, apply_rotx_180=apply_rotx_180,
-                invert_x=invert_x, invert_y=invert_y,
-                ray_len=ray_len, fid=fids[i],
-                verts_preflipped=verts_i,
-                collect_segments=True
-            )
-            all_segments.extend(seg_i)
-        else:
-            ov_i, cnt_i = compute_mano_joint_rays_mano_overlay_single(
-                out, model,
-                img_w, img_h,
-                cam_t=cam_t_list[i],
-                focal_length=focal_list[i],
-                axis=axis,
-                is_right_n=is_right_list[i],
-                line_color=line_color, thickness=thickness, alpha_value=alpha_value,
-                apply_x_flip=apply_x_flip, apply_rotx_180=apply_rotx_180,
-                invert_x=invert_x, invert_y=invert_y,
-                ray_len=ray_len, fid=fids[i],
-                verts_preflipped=verts_i,
-                collect_segments=False
-            )
-        acc += ov_i.astype(np.float32) / 255.0
-        total_cnt += cnt_i
+#     for i in range(N):
+#         verts_i = None if verts_list_preflipped is None else verts_list_preflipped[i]
+#         if collect_segments:
+#             ov_i, cnt_i, seg_i = compute_mano_joint_rays_mano_overlay_single(
+#                 out, model,
+#                 img_w, img_h,
+#                 cam_t=cam_t_list[i],
+#                 focal_length=focal_list[i],
+#                 axis=axis,
+#                 is_right_n=is_right_list[i],
+#                 line_color=line_color, thickness=thickness, alpha_value=alpha_value,
+#                 apply_x_flip=apply_x_flip, apply_rotx_180=apply_rotx_180,
+#                 invert_x=invert_x, invert_y=invert_y,
+#                 ray_len=ray_len, fid=fids[i],
+#                 verts_preflipped=verts_i,
+#                 collect_segments=True
+#             )
+#             all_segments.extend(seg_i)
+#         else:
+#             ov_i, cnt_i = compute_mano_joint_rays_mano_overlay_single(
+#                 out, model,
+#                 img_w, img_h,
+#                 cam_t=cam_t_list[i],
+#                 focal_length=focal_list[i],
+#                 axis=axis,
+#                 is_right_n=is_right_list[i],
+#                 line_color=line_color, thickness=thickness, alpha_value=alpha_value,
+#                 apply_x_flip=apply_x_flip, apply_rotx_180=apply_rotx_180,
+#                 invert_x=invert_x, invert_y=invert_y,
+#                 ray_len=ray_len, fid=fids[i],
+#                 verts_preflipped=verts_i,
+#                 collect_segments=False
+#             )
+#         acc += ov_i.astype(np.float32) / 255.0
+#         total_cnt += cnt_i
 
-    overlay = (np.clip(acc, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
-    return (overlay, total_cnt, all_segments) if collect_segments else (overlay, total_cnt)
+#     overlay = (np.clip(acc, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+#     return (overlay, total_cnt, all_segments) if collect_segments else (overlay, total_cnt)
 
 def build_forward_region_from_segments(segments, img_shape,
                                        width_px=18,        # 单侧半宽
@@ -709,3 +720,264 @@ def build_forward_region_from_segments(segments, img_shape,
             out[lab == i] = 255
 
     return out
+
+# new hand area
+
+def _rodrigues_rotate(v, k, theta):
+    """把向量 v 绕单位轴 k 旋转角 theta（弧度）"""
+    k = k / (np.linalg.norm(k) + 1e-12)
+    ct, st = np.cos(theta), np.sin(theta)
+    return v*ct + np.cross(k, v)*st + k*(np.dot(k, v))*(1.0-ct)
+
+def compute_mano_joint_rays_mano_overlay_single(
+    out, model,
+    img_w, img_h,
+    cam_t,
+    focal_length,
+    axis='y-',
+    is_right_n=1,
+    line_color=(0, 0, 255), thickness=2, alpha_value=1.0,
+    apply_x_flip=False, apply_rotx_180=False,
+    invert_x=False, invert_y=False,
+    ray_len=None, fid=0,
+    verts_preflipped=None,
+    collect_segments=False,
+    # ★ 改名为通用扭转目标，默认对“食指” (4,5,6)
+    twist_kp_indices=(4, 5, 6),
+    twist_deg=45.0               # 顺时针 45°
+):
+    import cv2
+
+    is_right = (int(is_right_n) == 1)
+    s = 1.0 if is_right else -1.0
+
+    # 顶点（与 silhouette 一致：左手对 x 取反）
+    if verts_preflipped is not None:
+        verts = np.asarray(verts_preflipped, dtype=np.float64).copy()
+    else:
+        verts = out['pred_vertices'][fid].detach().cpu().numpy().astype(np.float64)
+        verts[:, 0] *= s
+
+    # 关节（单 mano）
+    Jr = _dense_regressor(model.mano.J_regressor)
+    joints = Jr @ verts
+    if joints.shape[0] < 16:
+        overlay = np.zeros((img_h, img_w, 4), np.uint8)
+        return (overlay, 0, []) if collect_segments else (overlay, 0)
+
+    # 姿态旋转
+    g = out['pred_mano_params']['global_orient']
+    R_global = (g[fid, 0] if g.ndim == 4 else g[fid]).detach().cpu().numpy()
+    R_hand   = out['pred_mano_params']['hand_pose'][fid].detach().cpu().numpy()  # (15,3,3)
+
+    # 基轴
+    if isinstance(axis, str):
+        amap = {'x':[1,0,0],'y':[0,1,0],'z':[0,0,1],'x-':[-1,0,0],'y-':[0,-1,0],'z-':[0,0,-1]}
+        axis_vec = np.array(amap.get(axis.lower(), [0,-1,0]), dtype=np.float64)
+    else:
+        axis_vec = np.asarray(axis, dtype=np.float64)
+        axis_vec /= (np.linalg.norm(axis_vec) + 1e-12)
+
+    # 左手镜像方向
+    S = np.diag([s, 1.0, 1.0])
+
+    #—— 为 rotx180 / cam_t 做准备（与 silhouette 一致）——
+    R180 = _rotx_deg(180.0) if apply_rotx_180 else None
+    cam_t = np.asarray(cam_t, dtype=np.float64).copy()
+    if apply_x_flip:
+        cam_t[0] *= -1.0
+
+    # 生成射线（MANO 坐标）+ 记录关节索引
+    origins, directions, kp_list = [], [], []
+    twist_set = set(twist_kp_indices) if twist_kp_indices is not None else set()
+
+    for j_local, kp_idx in enumerate(range(1, 16)):  # 1..15
+        if kp_idx >= joints.shape[0]:
+            continue
+
+        # 基准方向（手局部轴 → 全局 → 左手镜像）
+        d = R_global @ (R_hand[j_local] @ axis_vec)
+        d = (S @ d)
+
+        # ★ 对目标关节进行“绕骨轴顺时针旋转 twist_deg”
+        if kp_idx in twist_set:
+            parent = _mano_parent(kp_idx)
+            b = joints[kp_idx] - joints[parent]  # 骨轴（MANO 坐标）
+            if np.isfinite(b).all() and np.linalg.norm(b) > 1e-8:
+                theta = -np.deg2rad(float(twist_deg))  # 约定：沿“父→子”看去为顺时针，取负角
+                d = _rodrigues_rotate(d, b, theta)
+
+        nrm = np.linalg.norm(d)
+        if not np.isfinite(d).all() or nrm < 1e-8:
+            continue
+        origins.append(joints[kp_idx])
+        directions.append(d / nrm)
+        kp_list.append(kp_idx)
+
+    if not origins:
+        overlay = np.zeros((img_h, img_w, 4), np.uint8)
+        return (overlay, 0, []) if collect_segments else (overlay, 0)
+
+    O = np.asarray(origins, dtype=np.float64)
+    D = np.asarray(directions, dtype=np.float64)
+    kp_list = np.asarray(kp_list, dtype=np.int32)
+
+    # rotx180 → +cam_t
+    if apply_rotx_180:
+        O = (R180 @ O.T).T
+        D = (R180 @ D.T).T
+    O_cam = O + cam_t
+
+    # 自适应长度（基于 V_cam）
+    V = verts.copy()
+    if apply_rotx_180:
+        V = (_rotx_deg(180.0) @ V.T).T
+    V_cam = V + cam_t
+    if ray_len is None:
+        bbox = V_cam.max(axis=0) - V_cam.min(axis=0)
+        L = 0.15 * float(np.max(bbox) if np.isfinite(bbox).all() else 1.0)
+    else:
+        L = float(ray_len)
+
+    P0, P1 = O_cam, O_cam + D * L
+
+    # 投影
+    fx = fy = float(focal_length)
+    cx, cy = img_w / 2.0, img_h / 2.0
+    def _proj(P):
+        z = P[:, 2]
+        valid = z > 1e-6
+        z_safe = np.where(valid, z, 1.0)
+        u = (P[:, 0] / z_safe) * fx + cx
+        v = (P[:, 1] / z_safe) * fy + cy
+        return np.stack([u, v], -1), valid
+
+    uv0, m0 = _proj(P0)
+    uv1, m1 = _proj(P1)
+    mask = m0 & m1
+
+    if invert_x:
+        uv0[:, 0] = 2 * cx - uv0[:, 0]; uv1[:, 0] = 2 * cx - uv1[:, 0]
+    if invert_y:
+        uv0[:, 1] = 2 * cy - uv0[:, 1]; uv1[:, 1] = 2 * cy - uv1[:, 1]
+
+    # 绘制 & 可选收集线段
+    overlay = np.zeros((img_h, img_w, 4), dtype=np.uint8)
+    draw_view = overlay[:, :, :3]
+    draw = draw_view if draw_view.flags['C_CONTIGUOUS'] else np.ascontiguousarray(draw_view)
+
+    c = (int(line_color[0]), int(line_color[1]), int(line_color[2]))
+    cnt = 0
+    segments = [] if collect_segments else None
+
+    for idx in np.where(mask)[0]:
+        x0, y0 = uv0[idx]; x1, y1 = uv1[idx]
+        if not np.isfinite([x0, y0, x1, y1]).all():
+            continue
+
+        if collect_segments:
+            segments.append({
+                'uv0': (float(x0), float(y0)),
+                'uv1': (float(x1), float(y1)),
+                'kp_idx': int(kp_list[idx]),
+                'hand_id': int(fid)
+            })
+
+        p0 = (int(round(x0)), int(round(y0)))
+        p1 = (int(round(x1)), int(round(y1)))
+        cv2.circle(draw, p0, radius=max(1, thickness+1), color=c, thickness=-1, lineType=cv2.LINE_AA)
+        cv2.arrowedLine(draw, p0, p1, c, thickness=thickness, tipLength=0.25, line_type=cv2.LINE_AA)
+        cnt += 1
+
+    if draw is not draw_view:
+        overlay[:, :, :3] = draw
+    cov = overlay[:, :, :3].max(axis=2, keepdims=True).astype(np.float32) / 255.0
+    overlay[:, :, :3] = np.where(cov > 0, 255, overlay[:, :, :3])
+    overlay[:, :, 3:4] = (cov * (alpha_value * 255)).astype(np.uint8)
+
+    return (overlay, cnt, segments) if collect_segments else (overlay, cnt)
+
+
+def compute_mano_joint_rays_mano_overlay_multi(
+    out, model,
+    img_w, img_h,
+    cam_t_list,
+    focal_length,
+    is_right_list,
+    axis='y-',
+    line_color=(0, 0, 255), thickness=2, alpha_value=1.0,
+    apply_x_flip=False, apply_rotx_180=False,
+    invert_x=False, invert_y=False,
+    ray_len=None,
+    fids=None,
+    verts_list_preflipped=None,
+    collect_segments=False,
+    # ★ 透传：默认就是食指
+    twist_kp_indices=(4, 5, 6),
+    twist_deg=45.0
+):
+    import numpy as np
+
+    cam_t_list = np.asarray(cam_t_list, dtype=np.float64)
+    if cam_t_list.ndim == 1:
+        cam_t_list = cam_t_list.reshape(1, 3)
+    N = cam_t_list.shape[0]
+
+    if isinstance(focal_length, (list, tuple, np.ndarray)):
+        focal_list = list(np.asarray(focal_length).reshape(-1))
+        if len(focal_list) == 1 and N > 1:
+            focal_list = focal_list * N
+    else:
+        focal_list = [float(focal_length)] * N
+
+    is_right_list = list(np.asarray(is_right_list).astype(int).reshape(-1))
+    if len(is_right_list) != N:
+        is_right_list = (is_right_list * N)[:N]
+
+    if fids is None:
+        fids = list(range(N))
+    else:
+        fids = list(np.asarray(fids).astype(int).reshape(-1))
+        if len(fids) != N:
+            raise ValueError("fids 长度必须与手的数量一致")
+
+    if verts_list_preflipped is not None:
+        verts_list_preflipped = [np.asarray(v, dtype=np.float64) for v in verts_list_preflipped]
+        if len(verts_list_preflipped) != N:
+            raise ValueError("verts_list_preflipped 长度必须与手的数量一致")
+
+    acc = np.zeros((img_h, img_w, 4), dtype=np.float32)
+    total_cnt = 0
+    all_segments = [] if collect_segments else None
+
+    for i in range(N):
+        verts_i = None if verts_list_preflipped is None else verts_list_preflipped[i]
+        common = dict(
+            out=out, model=model,
+            img_w=img_w, img_h=img_h,
+            cam_t=cam_t_list[i],
+            focal_length=focal_list[i],
+            axis=axis,
+            is_right_n=is_right_list[i],
+            line_color=line_color, thickness=thickness, alpha_value=alpha_value,
+            apply_x_flip=apply_x_flip, apply_rotx_180=apply_rotx_180,
+            invert_x=invert_x, invert_y=invert_y,
+            ray_len=ray_len, fid=fids[i],
+            verts_preflipped=verts_i,
+            twist_kp_indices=twist_kp_indices,  # ← 透传
+            twist_deg=twist_deg                  # ← 透传
+        )
+        if collect_segments:
+            ov_i, cnt_i, seg_i = compute_mano_joint_rays_mano_overlay_single(
+                collect_segments=True, **common
+            )
+            all_segments.extend(seg_i)
+        else:
+            ov_i, cnt_i = compute_mano_joint_rays_mano_overlay_single(
+                collect_segments=False, **common
+            )
+        acc += ov_i.astype(np.float32) / 255.0
+        total_cnt += cnt_i
+
+    overlay = (np.clip(acc, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    return (overlay, total_cnt, all_segments) if collect_segments else (overlay, total_cnt)
