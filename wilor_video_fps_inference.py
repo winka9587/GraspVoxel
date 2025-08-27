@@ -483,7 +483,7 @@ def main():
                     verts_list_preflipped=all_verts            # ★ 已取反的 verts，避免函数内重复取反
                 )
 
-                from visualization.interaction_area import compute_interaction_region_from_overlay
+                from visualization.interaction_area import compute_interaction_region_from_overlay, refine_interaction_region_from_overlay_with_direction
                 region_mask, heatmap, cnt = compute_interaction_region_from_overlay(overlay_ray)
                 # 可视化：把区域半透明涂在当前帧上
                 vis = img_cv2.copy()
@@ -493,14 +493,13 @@ def main():
                 fill = np.zeros_like(img_cv2, np.uint8); fill[:] = (0, 255, 255)
                 alpha = (region_mask.astype(np.float32)/255.0 * 0.35)[..., None]  # 35% 透明度
                 vis = (fill.astype(np.float32)*alpha + vis.astype(np.float32)*(1-alpha)).astype(np.uint8)
-
                 # 3) 叠加到原图 (alpha blend)
                 mano_ray = img_cv2.copy()
                 if mano_ray.shape[2] == 3:
                     alpha = overlay_ray[:, :, 3:4].astype(np.float32) / 255.0
                     fg = overlay_ray[:, :, :3].astype(np.float32)
                     mano_ray = (fg * alpha + mano_ray.astype(np.float32) * (1 - alpha)).astype(np.uint8)
-                
+            
 
 
         # 计算推理时间(从开始推理到手模渲染完成)
