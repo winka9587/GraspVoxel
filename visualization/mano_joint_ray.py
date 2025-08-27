@@ -981,3 +981,241 @@ def compute_mano_joint_rays_mano_overlay_multi(
 
     overlay = (np.clip(acc, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
     return (overlay, total_cnt, all_segments) if collect_segments else (overlay, total_cnt)
+
+
+import numpy as np, cv2
+
+def build_forward_region_from_segments_filtered(
+    segments, img_shape,
+    kp_filter: set,                 # 这根手指的关节集合，例如 {4,5,6}
+    hand_id_filter=None,            # 仅使用该 hand_id 的线段；None 表示不过滤
+    width_px=18,
+    extend_ratio=1.25,
+    min_area=200,
+    close_ks=9
+):
+    H, W = img_shape[:2]
+    canvas = np.zeros((H, W), np.uint8)
+
+    for s in segments:
+        if hand_id_filter is not None and s.get('hand_id', None) != hand_id_filter:
+            continue
+        if s.get('kp_idx', None) not in kp_filter:
+            continue
+
+        p0 = np.array(s['uv0'], dtype=np.float32)
+        p1 = np.array(s['uv1'], dtype=np.float32)
+        v  = p1 - p0
+        L  = float(np.linalg.norm(v))
+        if not np.isfinite(L) or L < 1.0:
+            continue
+
+        v /= L
+        n = np.array([-v[1], v[0]], dtype=np.float32)
+
+        # 只向前扩张（手背方向不扩张）
+        front_len = L * float(extend_ratio)
+        rear_len  = 0.0
+        half_w0, half_w1 = width_px*0.5, width_px
+
+        a0 = p0 + v*rear_len - n*half_w0
+        a1 = p0 + v*rear_len + n*half_w0
+        b0 = p1 + v*front_len - n*half_w1
+        b1 = p1 + v*front_len + n*half_w1
+
+        poly = np.stack([a0, a1, b1, b0], axis=0).astype(np.int32)
+        cv2.fillConvexPoly(canvas, poly, 255)
+
+        cap_center = (p1 + v*front_len).astype(np.int32)  # 只画前端圆帽
+        cv2.circle(canvas, tuple(cap_center), int(round(half_w1)), 255, -1)
+
+    if close_ks and close_ks > 1:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_ks, close_ks))
+        canvas = cv2.morphologyEx(canvas, cv2.MORPH_CLOSE, k)
+
+    # 过滤小噪声
+    num, lab, stats, _ = cv2.connectedComponentsWithStats(canvas, connectivity=8)
+    out = np.zeros_like(canvas)
+    for i in range(1, num):
+        if stats[i, cv2.CC_STAT_AREA] >= int(min_area):
+            out[lab == i] = 255
+
+    return out
+
+
+def build_interaction_region_five_finger_intersection(
+    segments, img_shape,
+    groups_map=None,                 # 可自定义：{'thumb': {1,2,3}, ...}
+    width_px=18,
+    extend_ratio=1.25,
+    min_area_per_finger=200,
+    close_ks_per_finger=9,
+    intersect_dilate_px=0            # 交集前，先对每根手指区域做微膨胀，避免“空交集”
+):
+    H, W = img_shape[:2]
+    if groups_map is None:
+        groups_map = {
+            'thumb':  {1,2,3},
+            'index':  {4,5,6},
+            'middle': {7,8,9},
+            'ring':   {10,11,12},
+            'little': {13,14,15},
+        }
+
+    # 分手（hand_id）处理：同一只手内部做“五指交集”，最后各手做并集
+    hand_ids = sorted({s.get('hand_id', 0) for s in segments})
+    final_union = np.zeros((H, W), np.uint8)
+
+    # 可选：交集前的轻度膨胀核
+    dil_k = None
+    if intersect_dilate_px and intersect_dilate_px > 0:
+        ksz = int(intersect_dilate_px)*2 + 1
+        dil_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz))
+
+    for hid in hand_ids:
+        per_finger_masks = []
+
+        # 逐指生成候选
+        for _, kp_set in groups_map.items():
+            mask = build_forward_region_from_segments_filtered(
+                segments, img_shape,
+                kp_filter=set(kp_set),
+                hand_id_filter=hid,
+                width_px=width_px,
+                extend_ratio=extend_ratio,
+                min_area=min_area_per_finger,
+                close_ks=close_ks_per_finger
+            )
+            if dil_k is not None and mask.any():
+                mask = cv2.dilate(mask, dil_k, iterations=1)
+            per_finger_masks.append(mask)
+
+        # 若某些手指没有候选，交集会空；这里做一个“只和存在的做交集”的逻辑
+        valid_masks = [m for m in per_finger_masks if m is not None and m.any()]
+        if not valid_masks:
+            continue
+
+        inter = valid_masks[0].copy()
+        for m in valid_masks[1:]:
+            inter = cv2.bitwise_and(inter, m)
+
+        # 若交集太空，可退一步：至少与（存在手指里）面积最大的两根手指做交集
+        if inter.sum() == 0 and len(valid_masks) >= 2:
+            areas = [int(v.sum()) for v in valid_masks]
+            idx_sorted = np.argsort(areas)[::-1]  # 按面积降序
+            inter = valid_masks[idx_sorted[0]].copy()
+            inter = cv2.bitwise_and(inter, valid_masks[idx_sorted[1]])
+
+        final_union = cv2.bitwise_or(final_union, inter)
+
+    return final_union
+
+
+def build_forward_region_from_segments_ray(segments, img_shape,
+                                       width_px=18,        # 单侧半宽
+                                       extend_ratio=1.25,  # 在前向的额外伸长倍数
+                                       tips_only=True,     # 仅末节
+                                       min_area=300,
+                                       close_ks=11):
+    """
+    将每条线段的前向扩张方向从原来的“射线方向 v”改为
+    “射线方向 v 与手指骨链方向 f 的角平分线 w = normalize(v_hat + f_hat)”，
+    若两者近乎相反则退回 v。
+    末节集合默认剔除了大拇指(13,14,15) —— 如需包含，重置 tip_kp 集合即可。
+    """
+    import numpy as np, cv2
+
+    H, W = img_shape[:2]
+    canvas = np.zeros((H, W), np.uint8)
+
+    # --------- 工具：MANO 父/子关系（0=腕；1..3拇指，4..6食，7..9中，10..12无名，13..15小）---------
+    def _mano_parent(kp):
+        return 0 if kp in (1,4,7,10,13) else (kp-1)
+    def _mano_child(kp):
+        return None if kp in (3,6,9,12,15) else (kp+1)
+
+    # --------- 先做每只手的 uv0 查表（避免跨手串联）---------
+    # 若没有 hand_id 字段，也能工作（默认 hand_id=None）
+    uv0_by_hand = {}
+    for s in segments:
+        hid = s.get('hand_id', None)
+        kp  = s.get('kp_idx', None)
+        if kp is None: 
+            continue
+        uv0_by_hand.setdefault(hid, {})[kp] = np.array(s['uv0'], dtype=np.float32)
+
+    # --------- 末节集合（默认不含拇指末节 15；如需包含，改为 {3,6,9,12,15}）---------
+    tip_kp = {3, 6, 9, 12} if tips_only else None
+
+    for s in segments:
+        hid = s.get('hand_id', None)
+        kp  = s.get('kp_idx', 1)
+
+        # tips_only 过滤
+        if tips_only and kp not in tip_kp:
+            continue
+
+        p0 = np.array(s['uv0'], dtype=np.float32)   # 关节投影
+        p1 = np.array(s['uv1'], dtype=np.float32)   # 射线端点投影
+        v  = p1 - p0                                 # 射线 2D 方向
+        Lv = float(np.linalg.norm(v))
+        if not np.isfinite(Lv) or Lv < 1.0:
+            continue
+        v_hat = v / Lv
+
+        # --------- 计算“指头方向” f_hat（沿骨链指向远端）---------
+        # 优先用子关节（更接近“指向指尖”）；若无子，则用 parent->kp 方向
+        uv0_map = uv0_by_hand.get(hid, {})
+        child = _mano_child(kp)
+        parent = _mano_parent(kp)
+
+        f = None
+        if child is not None and child in uv0_map:
+            f = uv0_map[child] - p0            # kp -> child
+        elif parent in uv0_map:
+            f = p0 - uv0_map[parent]           # parent -> kp（指向远端）
+        if f is None or not np.isfinite(f).all() or np.linalg.norm(f) < 1.0:
+            f_hat = v_hat.copy()               # 兜底：退回射线方向
+        else:
+            f_hat = f / (np.linalg.norm(f) + 1e-12)
+
+        # --------- 角平分线方向 ---------
+        w = v_hat + f_hat
+        Lw = float(np.linalg.norm(w))
+        if not np.isfinite(Lw) or Lw < 1e-6:
+            w_hat = v_hat                      # 近似对向时退回射线方向
+        else:
+            w_hat = w / Lw
+
+        # 前向法线（与 w_hat 垂直），用于构造条带宽度
+        n = np.array([-w_hat[1], w_hat[0]], dtype=np.float32)
+
+        # 仅向前扩张
+        front_len = Lv * float(extend_ratio)
+        rear_len  = 0.0
+        half_w0, half_w1 = width_px*0.5, width_px   # 可按需调节“前端更宽/等宽”
+
+        a0 = p0 + w_hat*rear_len - n*half_w0
+        a1 = p0 + w_hat*rear_len + n*half_w0
+        b0 = p1 + w_hat*front_len - n*half_w1
+        b1 = p1 + w_hat*front_len + n*half_w1
+
+        poly = np.stack([a0, a1, b1, b0], axis=0).astype(np.int32)
+        cv2.fillConvexPoly(canvas, poly, 255)
+
+        # 前端圆帽（沿角平分线方向推进）
+        cap_center = (p1 + w_hat*front_len).astype(np.int32)
+        cv2.circle(canvas, tuple(cap_center), int(round(half_w1)), 255, -1)
+
+    # 闭运算 + 面积过滤
+    if close_ks and close_ks > 1:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_ks, close_ks))
+        canvas = cv2.morphologyEx(canvas, cv2.MORPH_CLOSE, k)
+
+    num, lab, stats, _ = cv2.connectedComponentsWithStats(canvas, connectivity=8)
+    out = np.zeros_like(canvas)
+    for i in range(1, num):
+        if stats[i, cv2.CC_STAT_AREA] >= int(min_area):
+            out[lab == i] = 255
+
+    return out

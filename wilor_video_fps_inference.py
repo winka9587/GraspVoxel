@@ -484,12 +484,13 @@ def main():
                     fids=list(range(len(all_cam_t))),
                     verts_list_preflipped=all_verts,
                     collect_segments=True,                 # ★ 开启收集线段
-                    twist_kp_indices=(13,14,15),     # 若你的 thumb 索引不同，请据实调整
+                    # twist_kp_indices=(13,14,15),     # 若你的 thumb 索引不同，请据实调整
+                    twist_kp_indices=(13, 14, 15),     # 若你的 thumb 索引不同，请据实调整
                     twist_deg=45.0          # 顺时针 45°（从根→尖看为顺时针）
                 )
-                from visualization.mano_joint_ray import build_forward_region_from_segments
+                from visualization.mano_joint_ray import build_forward_region_from_segments_ray, build_interaction_region_five_finger_intersection
                 # 2) 只沿射线“前向”扩张得到交互区域（不在手背方向扩张）
-                region_mask = build_forward_region_from_segments(
+                region_mask = build_forward_region_from_segments_ray(
                     segments, img_shape=(H, W),
                     width_px=18,         # 带宽（可调 12~24）
                     extend_ratio=1.25,   # 前端伸长（可调 1.0~1.6）
@@ -497,6 +498,18 @@ def main():
                     min_area=300,
                     close_ks=11
                 )
+
+                # region_mask = build_interaction_region_five_finger_intersection(
+                #     segments,
+                #     img_shape=(H, W),
+                #     # 如果你的关节分组与默认不一致，可以自定义：
+                #     # groups_map={'thumb': {13,14,15}, 'index': {4,5,6}, ...}
+                #     width_px=18,
+                #     extend_ratio=1.25,
+                #     min_area_per_finger=200,
+                #     close_ks_per_finger=9,
+                #     intersect_dilate_px=6     # 小幅度放宽再求交，避免交集为空（可调 0/4/6/8）
+                # )
 
                 # 3) 可视化区域 +（可选）再叠射线
                 mano_ray_direction = img_cv2.copy()
