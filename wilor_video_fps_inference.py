@@ -289,7 +289,7 @@ def main():
         overlay = img_cv2.copy()          # 手重建/叠加主图
         overlay_2dbbox = img_cv2.copy()   # 2D 检测框可视化
         mano_ray = img_cv2.copy()         # 关节射线图
-        vis = img_cv2.copy()
+        mano_ray_direction = img_cv2.copy()
         mesh_rendered = False             # 是否真的完成了重建/渲染
 
         current_time = time.time()
@@ -417,88 +417,106 @@ def main():
                 out_u8_bbox = np.clip(out_rgb_bbox * 255, 0, 255).astype(np.uint8)
                 overlay_2dbbox = np.ascontiguousarray(out_u8_bbox[..., ::-1])
                 mesh_rendered = True
-                
-                
-                # rays = compute_mano_joint_rays(out, model, axis='y-')
-                # # 2) 生成覆盖层（与 hand_silhouette_overlay 同参数风格）
-                # overlay_ray, n = draw_joint_rays_overlay(
-                #     rays, cam_t=out['pred_cam_t'][0].detach().cpu().numpy(),  # 或你的 cam_t
-                #     img_w=img_cv2.shape[1], img_h=img_cv2.shape[0], focal_length=8000,
-                #     line_color=(0, 0, 255), thickness=2,
-                #     apply_x_flip=False, apply_rotx_180=False,
-                #     invert_x=False, invert_y=False,
-                # )
-                # overlay_ray, n = compute_mano_joint_rays_mano_overlay(
-                #     out, model,
-                #     img_w=img_cv2.shape[1], img_h=img_cv2.shape[0],
-                #     focal_length=float(scaled_focal),  # 建议用 scaled_focal
-                #     axis='y-',
-                #     line_color=(0,0,255), thickness=2, alpha_value=1.0,
-                #     apply_x_flip=False, apply_rotx_180=False,
-                #     invert_x=False, invert_y=False,
-                #     cam_t=out['pred_cam_t'][0].detach().cpu().numpy(),  # 与 silhouette 一致：V_cam = V + cam_t
-                #     ray_len=None                                       # None=自适应；也可给固定值
-                # )
-                cam_t_used = cam_t                               # 就是你传给 hand_silhouette_overlay 的那份
-                focal_used = float(scaled_focal)                 # 同上
 
-                # print(f"is_right_n: {is_right_n}")
-                # overlay_ray, n = compute_mano_joint_rays_mano_overlay(
+                # overlay_ray, n = compute_mano_joint_rays_mano_overlay_multi(
                 #     out, model,
                 #     img_w=W, img_h=H,
-                #     cam_t=cam_t_used,            # ★ 与 silhouette 相同
-                #     focal_length=focal_used,     # ★ 与 silhouette 相同
+                #     cam_t_list=all_cam_t,
+                #     focal_length=float(scaled_focal),          # 同帧共用一个焦距 -> 标量即可
+                #     is_right_list=[int(r) for r in all_right], # 0/1
                 #     axis='y-',
-                #     line_color=(0,0,255), thickness=2, alpha_value=1.0,
-                #     apply_x_flip=False, apply_rotx_180=False,
-                #     invert_x=False, invert_y=False,
-                #     ray_len=None
-                # )
-                # overlay_ray, n = compute_mano_joint_rays_mano_overlay(
-                #     out, model,
-                #     img_w=W, img_h=H,
-                #     cam_t=cam_t,                               # ← 传给 silhouette 的同一份 cam_t
-                #     focal_length=float(scaled_focal),          # ← 传给 silhouette 的同一份 focal
-                #     axis='y-',
-                #     is_right_n=int(right_flag),                # ← 1=右手, 0=左手
                 #     line_color=(0,0,255), thickness=2, alpha_value=1.0,
                 #     apply_x_flip=False, apply_rotx_180=False,
                 #     invert_x=False, invert_y=False,
                 #     ray_len=None,
-                #     # 若你已经在外面对 verts 做了 x 取反，可以直接传进来避免函数内部再取反：
-                #     # verts_preflipped=verts
+                #     fids=list(range(len(all_cam_t))),          # 与 out 的 batch 顺序一致
+                #     verts_list_preflipped=all_verts            # ★ 已取反的 verts，避免函数内重复取反
                 # )
-                overlay_ray, n = compute_mano_joint_rays_mano_overlay_multi(
+
+                # from visualization.interaction_area import compute_interaction_region_from_overlay
+                # region_mask, heatmap, cnt = compute_interaction_region_from_overlay(overlay_ray)
+                # # 可视化：把区域半透明涂在当前帧上
+                # vis = img_cv2.copy()
+                # if cnt is not None:
+                #     cv2.drawContours(vis, [cnt], -1, (0, 255, 255), thickness=2)  # 画黄边
+                # # 叠加填充
+                # fill = np.zeros_like(img_cv2, np.uint8); fill[:] = (0, 255, 255)
+                # alpha = (region_mask.astype(np.float32)/255.0 * 0.35)[..., None]  # 35% 透明度
+                # vis = (fill.astype(np.float32)*alpha + vis.astype(np.float32)*(1-alpha)).astype(np.uint8)
+                # # 3) 叠加到原图 (alpha blend)
+                # mano_ray = img_cv2.copy()
+                # if mano_ray.shape[2] == 3:
+                #     alpha = overlay_ray[:, :, 3:4].astype(np.float32) / 255.0
+                #     fg = overlay_ray[:, :, :3].astype(np.float32)
+                #     mano_ray = (fg * alpha + mano_ray.astype(np.float32) * (1 - alpha)).astype(np.uint8)
+
+                # from visualization.mano_joint_ray import compute_interaction_region_from_overlay_dir
+                # # 2) 方向约束 + 区域压缩（掌心前向 + 指尖锥体）
+                # region_mask = compute_interaction_region_from_overlay_dir(
+                #     overlay_ray,
+                #     out, model,
+                #     img_w=W, img_h=H,
+                #     cam_t_list=all_cam_t,
+                #     focal_length=float(scaled_focal),
+                #     is_right_list=[int(r) for r in all_right],
+                #     fids=list(range(len(all_cam_t))),
+                #     verts_list_preflipped=all_verts,
+                #     axis='y-',
+                #     apply_rotx_180=False, apply_x_flip=False,
+                #     expand_px=12,          # 射线带宽
+                #     theta_front_deg=70,    # 掌心前向阈
+                #     phi_finger_deg=35,     # 指尖锥体阈
+                #     min_area=300
+                # )
+
+                # 1) 生成射线 + 收集 2D 线段
+                overlay_ray, n, segments = compute_mano_joint_rays_mano_overlay_multi(
                     out, model,
                     img_w=W, img_h=H,
                     cam_t_list=all_cam_t,
-                    focal_length=float(scaled_focal),          # 同帧共用一个焦距 -> 标量即可
-                    is_right_list=[int(r) for r in all_right], # 0/1
+                    focal_length=float(scaled_focal),
+                    is_right_list=[int(r) for r in all_right],
                     axis='y-',
                     line_color=(0,0,255), thickness=2, alpha_value=1.0,
                     apply_x_flip=False, apply_rotx_180=False,
                     invert_x=False, invert_y=False,
                     ray_len=None,
-                    fids=list(range(len(all_cam_t))),          # 与 out 的 batch 顺序一致
-                    verts_list_preflipped=all_verts            # ★ 已取反的 verts，避免函数内重复取反
+                    fids=list(range(len(all_cam_t))),
+                    verts_list_preflipped=all_verts,
+                    collect_segments=True                 # ★ 开启收集线段
+                )
+                from visualization.mano_joint_ray import build_forward_region_from_segments
+                # 2) 只沿射线“前向”扩张得到交互区域（不在手背方向扩张）
+                region_mask = build_forward_region_from_segments(
+                    segments, img_shape=(H, W),
+                    width_px=18,         # 带宽（可调 12~24）
+                    extend_ratio=1.25,   # 前端伸长（可调 1.0~1.6）
+                    tips_only=True,      # 只用末节线段，更贴近抓取/触碰
+                    min_area=300,
+                    close_ks=11
                 )
 
-                from visualization.interaction_area import compute_interaction_region_from_overlay, refine_interaction_region_from_overlay_with_direction
-                region_mask, heatmap, cnt = compute_interaction_region_from_overlay(overlay_ray)
-                # 可视化：把区域半透明涂在当前帧上
-                vis = img_cv2.copy()
-                if cnt is not None:
-                    cv2.drawContours(vis, [cnt], -1, (0, 255, 255), thickness=2)  # 画黄边
-                # 叠加填充
-                fill = np.zeros_like(img_cv2, np.uint8); fill[:] = (0, 255, 255)
-                alpha = (region_mask.astype(np.float32)/255.0 * 0.35)[..., None]  # 35% 透明度
-                vis = (fill.astype(np.float32)*alpha + vis.astype(np.float32)*(1-alpha)).astype(np.uint8)
-                # 3) 叠加到原图 (alpha blend)
-                mano_ray = img_cv2.copy()
-                if mano_ray.shape[2] == 3:
-                    alpha = overlay_ray[:, :, 3:4].astype(np.float32) / 255.0
-                    fg = overlay_ray[:, :, :3].astype(np.float32)
-                    mano_ray = (fg * alpha + mano_ray.astype(np.float32) * (1 - alpha)).astype(np.uint8)
+                # 3) 可视化区域 +（可选）再叠射线
+                mano_ray_direction = img_cv2.copy()
+                fill = np.zeros_like(mano_ray_direction); fill[:] = (0, 255, 255)
+                alpha_m = (region_mask.astype(np.float32)/255.0 * 0.35)[..., None]
+                mano_ray_direction = (fill.astype(np.float32)*alpha_m + mano_ray_direction.astype(np.float32)*(1-alpha_m)).astype(np.uint8)
+
+                alpha_ray = overlay_ray[:, :, 3:4].astype(np.float32) / 255.0
+                fg_ray   = overlay_ray[:, :, :3].astype(np.float32)
+                mano_ray_direction = (fg_ray * alpha_ray + mano_ray_direction.astype(np.float32) * (1 - alpha_ray)).astype(np.uint8)
+
+
+                # # 3) 可视化：把交互区域涂在当前画面上
+                # mano_ray_direction = img_cv2.copy()
+                # fill = np.zeros_like(mano_ray_direction, np.uint8); fill[:] = (0, 255, 255)   # 黄色
+                # alpha_m = (region_mask.astype(np.float32)/255.0 * 0.35)[..., None]  # 35% 透明
+                # mano_ray_direction = (fill.astype(np.float32)*alpha_m + mano_ray_direction.astype(np.float32)*(1-alpha_m)).astype(np.uint8)
+
+                # # 若你也想叠射线本身：
+                # alpha_ray = overlay_ray[:, :, 3:4].astype(np.float32)/255.0
+                # fg_ray = overlay_ray[:, :, :3].astype(np.float32)
+                # mano_ray_direction = (fg_ray * alpha_ray + mano_ray_direction.astype(np.float32) * (1 - alpha_ray)).astype(np.uint8)
             
 
 
@@ -528,7 +546,7 @@ def main():
         cv2.imshow('Hand Recon', overlay)  # hand 重建结果
         cv2.imshow('Detection Result', overlay_2dbbox)  # detection的2D包围盒
         cv2.imshow('mano ray', mano_ray)
-        cv2.imshow('interaction region', vis)
+        cv2.imshow('interaction region', mano_ray_direction)
 
 
         if args.save and writer is None:
