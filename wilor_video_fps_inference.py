@@ -488,39 +488,29 @@ def main():
                     twist_kp_indices=(13, 14, 15),     # 若你的 thumb 索引不同，请据实调整
                     twist_deg=45.0          # 顺时针 45°（从根→尖看为顺时针）
                 )
-                from visualization.mano_joint_ray import build_forward_region_from_segments_ray, build_interaction_region_five_finger_intersection
+                from visualization.mano_joint_ray import build_interaction_region_starconvex 
                 # 2) 只沿射线“前向”扩张得到交互区域（不在手背方向扩张）
-                region_mask = build_forward_region_from_segments_ray(
-                    segments, img_shape=(H, W),
-                    width_px=18,         # 带宽（可调 12~24）
-                    extend_ratio=1.25,   # 前端伸长（可调 1.0~1.6）
-                    tips_only=True,      # 只用末节线段，更贴近抓取/触碰
-                    min_area=300,
-                    close_ks=11
+                region_mask, polys = build_interaction_region_starconvex(
+                    segments,
+                    img_shape=(H, W),
+                    tips_only=True,             # 只用末节（默认不含 15）
+                    exclude_kp={13,14,15},      # 继续排除大拇指
+                    smooth_lambda=1.5,          # 半径平滑强度（越大越圆滑）
+                    huber_delta=2.0,            # 稳健权阈值
+                    irls_iters=5,
+                    min_area=120,
+                    close_ks=9
                 )
 
-                # region_mask = build_interaction_region_five_finger_intersection(
-                #     segments,
-                #     img_shape=(H, W),
-                #     # 如果你的关节分组与默认不一致，可以自定义：
-                #     # groups_map={'thumb': {13,14,15}, 'index': {4,5,6}, ...}
-                #     width_px=18,
-                #     extend_ratio=1.25,
-                #     min_area_per_finger=200,
-                #     close_ks_per_finger=9,
-                #     intersect_dilate_px=6     # 小幅度放宽再求交，避免交集为空（可调 0/4/6/8）
-                # )
-
-                # 3) 可视化区域 +（可选）再叠射线
                 mano_ray_direction = img_cv2.copy()
-                fill = np.zeros_like(mano_ray_direction); fill[:] = (0, 255, 255)
-                alpha_m = (region_mask.astype(np.float32)/255.0 * 0.35)[..., None]
-                mano_ray_direction = (fill.astype(np.float32)*alpha_m + mano_ray_direction.astype(np.float32)*(1-alpha_m)).astype(np.uint8)
+                fill = np.zeros_like(mano_ray_direction); fill[:] = (0,220,255)
+                alpha = (region_mask.astype(np.float32)/255.0 * 0.35)[...,None]
+                vis = (fill.astype(np.float32)*alpha + mano_ray_direction.astype(np.float32)*(1-alpha)).astype(np.uint8)
 
-                alpha_ray = overlay_ray[:, :, 3:4].astype(np.float32) / 255.0
-                fg_ray   = overlay_ray[:, :, :3].astype(np.float32)
-                mano_ray_direction = (fg_ray * alpha_ray + mano_ray_direction.astype(np.float32) * (1 - alpha_ray)).astype(np.uint8)
-
+                # （可选）画拟合多边形边界
+                for hid, poly in (polys or {}).items():
+                    pts = poly.reshape(-1,1,2).astype(np.int32)
+                    cv2.polylines(mano_ray_direction, [pts], isClosed=True, color=(0,140,255), thickness=2, lineType=cv2.LINE_AA)
 
                 # # 3) 可视化：把交互区域涂在当前画面上
                 # mano_ray_direction = img_cv2.copy()

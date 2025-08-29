@@ -875,12 +875,22 @@ def compute_mano_joint_rays_mano_overlay_single(
         if not np.isfinite([x0, y0, x1, y1]).all():
             continue
 
+        # if collect_segments:
+        #     segments.append({
+        #         'uv0': (float(x0), float(y0)),
+        #         'uv1': (float(x1), float(y1)),
+        #         'kp_idx': int(kp_list[idx]),
+        #         'hand_id': int(fid)
+        #     })
+            # 有效 idx 循环里，收集段时一并保存 3D：
         if collect_segments:
             segments.append({
                 'uv0': (float(x0), float(y0)),
                 'uv1': (float(x1), float(y1)),
                 'kp_idx': int(kp_list[idx]),
-                'hand_id': int(fid)
+                'hand_id': int(fid),
+                'O_cam': O_cam[idx].astype(np.float32),  # ★ 起点(相机系)
+                'D_cam': D[idx].astype(np.float32),      # ★ 方向(单位)
             })
 
         p0 = (int(round(x0)), int(round(y0)))
@@ -1219,3 +1229,82 @@ def build_forward_region_from_segments_ray(segments, img_shape,
             out[lab == i] = 255
 
     return out
+
+
+from visualization.optim import fit_cylinder_gauss_newton, rasterize_cylinder_region
+def build_interaction_region_cylinder_gn(
+    segments, img_shape, focal_length,
+    exclude_kp={13,14,15},
+    max_iters=15, huber_delta=3.0, lambda_damp=1e-3,
+    min_area=200, close_ks=9
+):
+    H, W = img_shape[:2]
+
+    # 按 hand_id 分组 & 过滤
+    hands = {}
+    for s in segments:
+        if s.get('kp_idx') in (exclude_kp or set()):
+            continue
+        # 要求 O_cam / D_cam
+        if ('O_cam' not in s) or ('D_cam' not in s):
+            continue
+        hid = s.get('hand_id', 0)
+        hands.setdefault(hid, []).append(s)
+
+    region_all = np.zeros((H, W), np.uint8)
+
+    for hid, rays in hands.items():
+        if len(rays) < 4:
+            continue  # 数据点太少，跳过
+        c, a, r, t_stars, inlier = fit_cylinder_gauss_newton(
+            rays, max_iters=max_iters, huber_delta=huber_delta, lambda_damp=lambda_damp
+        )
+
+        # 仅用内点生成区域（更稳）
+        rays_in = [rays[i] for i in range(len(rays)) if inlier[i]]
+        t_in    = [t_stars[i] for i in range(len(rays)) if inlier[i]]
+        if len(rays_in) < 3:
+            rays_in, t_in = rays, t_stars  # 兜底
+
+        mask = rasterize_cylinder_region(
+            rays_in, t_in, img_w=W, img_h=H, focal_length=focal_length,
+            c=c, a=a, r=r, min_area=min_area, close_ks=close_ks
+        )
+        region_all = cv2.bitwise_or(region_all, mask)
+
+    return region_all
+
+from visualization.optim import fit_starconvex_polygon_from_segments, rasterize_polygon_mask
+def build_interaction_region_starconvex(
+    segments, img_shape,
+    tips_only=True,
+    exclude_kp={13,14,15},
+    smooth_lambda=2.0,
+    huber_delta=2.0,
+    irls_iters=5,
+    min_area=250,
+    close_ks=9
+):
+    # 按 hand_id 分组
+    by_hand = {}
+    for s in segments:
+        hid = s.get('hand_id', 0)
+        by_hand.setdefault(hid, []).append(s)
+
+    final_mask = np.zeros(img_shape[:2], np.uint8)
+    polys = {}
+
+    for hid, segs in by_hand.items():
+        fit = fit_starconvex_polygon_from_segments(
+            segs, tips_only=tips_only, exclude_kp=exclude_kp,
+            smooth_lambda=smooth_lambda, huber_delta=huber_delta, irls_iters=irls_iters
+        )
+        if fit is None:
+            continue
+        mask = rasterize_polygon_mask(
+            fit['polygon'], img_shape, min_area=min_area, close_ks=close_ks
+        )
+        final_mask = cv2.bitwise_or(final_mask, mask)
+        polys[hid] = fit['polygon']
+
+    return final_mask, polys
