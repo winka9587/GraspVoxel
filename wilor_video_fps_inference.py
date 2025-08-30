@@ -488,41 +488,54 @@ def main():
                     twist_kp_indices=(13, 14, 15),     # 若你的 thumb 索引不同，请据实调整
                     twist_deg=45.0          # 顺时针 45°（从根→尖看为顺时针）
                 )
-                from visualization.mano_joint_ray import build_interaction_region_starconvex 
+                # from visualization.mano_joint_ray import build_interaction_region_starconvex_robust 
+                from visualization.optim import build_interaction_region_starconvex_robust
                 # 2) 只沿射线“前向”扩张得到交互区域（不在手背方向扩张）
-                region_mask, polys = build_interaction_region_starconvex(
+                # region_mask, polys = build_interaction_region_starconvex(
+                #     segments,
+                #     img_shape=(H, W),
+                #     tips_only=True,             # 只用末节（默认不含 15）
+                #     exclude_kp={13,14,15},      # 继续排除大拇指
+                #     smooth_lambda=1.5,          # 半径平滑强度（越大越圆滑）
+                #     huber_delta=2.0,            # 稳健权阈值
+                #     irls_iters=5,
+                #     min_area=120,
+                #     close_ks=9
+                # )
+                region_mask, poly = build_interaction_region_starconvex_robust(
                     segments,
                     img_shape=(H, W),
-                    tips_only=True,             # 只用末节（默认不含 15）
-                    exclude_kp={13,14,15},      # 继续排除大拇指
-                    smooth_lambda=1.5,          # 半径平滑强度（越大越圆滑）
-                    huber_delta=2.0,            # 稳健权阈值
-                    irls_iters=5,
-                    min_area=120,
-                    close_ks=9
+                    tips_only=True,
+                    exclude_kp={13,14,15},
+                    augment_k=2,        # 每条射线左右各加2个扇区
+                    delta_deg=20.0,
+                    anchor_mode='fraction',
+                    anchor_frac=0.85,
+                    anchor_weight=1.5,
+                    smooth_lambda=0.6,
+                    huber_delta=3.0,
+                    irls_iters=6,
+                    scale_prior_weight=0.5
                 )
 
+                # 可视化叠加
                 mano_ray_direction = img_cv2.copy()
-                fill = np.zeros_like(mano_ray_direction); fill[:] = (0,220,255)
+                fill = np.zeros_like(mano_ray_direction); fill[:] = (0, 220, 255)
                 alpha = (region_mask.astype(np.float32)/255.0 * 0.35)[...,None]
-                vis = (fill.astype(np.float32)*alpha + mano_ray_direction.astype(np.float32)*(1-alpha)).astype(np.uint8)
+                mano_ray_direction = (fill.astype(np.float32)*alpha + mano_ray_direction.astype(np.float32)*(1-alpha)).astype(np.uint8)
+                if poly is not None:
+                    cv2.polylines(mano_ray_direction, [poly.reshape(-1,1,2).astype(np.int32)], True, (0,140,255), 2, cv2.LINE_AA)
 
-                # （可选）画拟合多边形边界
-                for hid, poly in (polys or {}).items():
-                    pts = poly.reshape(-1,1,2).astype(np.int32)
-                    cv2.polylines(mano_ray_direction, [pts], isClosed=True, color=(0,140,255), thickness=2, lineType=cv2.LINE_AA)
 
-                # # 3) 可视化：把交互区域涂在当前画面上
                 # mano_ray_direction = img_cv2.copy()
-                # fill = np.zeros_like(mano_ray_direction, np.uint8); fill[:] = (0, 255, 255)   # 黄色
-                # alpha_m = (region_mask.astype(np.float32)/255.0 * 0.35)[..., None]  # 35% 透明
-                # mano_ray_direction = (fill.astype(np.float32)*alpha_m + mano_ray_direction.astype(np.float32)*(1-alpha_m)).astype(np.uint8)
+                # fill = np.zeros_like(mano_ray_direction); fill[:] = (0,220,255)
+                # alpha = (region_mask.astype(np.float32)/255.0 * 0.35)[...,None]
+                # vis = (fill.astype(np.float32)*alpha + mano_ray_direction.astype(np.float32)*(1-alpha)).astype(np.uint8)
 
-                # # 若你也想叠射线本身：
-                # alpha_ray = overlay_ray[:, :, 3:4].astype(np.float32)/255.0
-                # fg_ray = overlay_ray[:, :, :3].astype(np.float32)
-                # mano_ray_direction = (fg_ray * alpha_ray + mano_ray_direction.astype(np.float32) * (1 - alpha_ray)).astype(np.uint8)
-            
+                # # （可选）画拟合多边形边界
+                # for hid, poly in (polys or {}).items():
+                #     pts = poly.reshape(-1,1,2).astype(np.int32)
+                #     cv2.polylines(mano_ray_direction, [pts], isClosed=True, color=(0,140,255), thickness=2, lineType=cv2.LINE_AA)
 
 
         # 计算推理时间(从开始推理到手模渲染完成)
