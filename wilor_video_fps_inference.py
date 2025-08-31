@@ -268,6 +268,13 @@ def main():
     start_time = time.time()
     perf_history = []
 
+    from visualization.optim import GraspVolumeHeatmap, compute_mano_rays_in_cam
+    heat3d = GraspVolumeHeatmap(
+        voxel_size=0.01,   # 体素边长 ~1cm；若无尺度，用 bbox 尺度：把 0.01 改成 0.01*diag
+        margin=0.06,
+        decay=0.98
+    )
+
     resize_target = 640.0
     while True:
         ok, img_cv2 = cap.read()
@@ -288,7 +295,6 @@ def main():
         # —— 每帧安全默认值 —— 
         overlay = img_cv2.copy()          # 手重建/叠加主图
         overlay_2dbbox = img_cv2.copy()   # 2D 检测框可视化
-        mano_ray = img_cv2.copy()         # 关节射线图
         mano_ray_direction = img_cv2.copy()
         mesh_rendered = False             # 是否真的完成了重建/渲染
 
@@ -418,125 +424,58 @@ def main():
                 overlay_2dbbox = np.ascontiguousarray(out_u8_bbox[..., ::-1])
                 mesh_rendered = True
 
-                # overlay_ray, n = compute_mano_joint_rays_mano_overlay_multi(
-                #     out, model,
-                #     img_w=W, img_h=H,
-                #     cam_t_list=all_cam_t,
-                #     focal_length=float(scaled_focal),          # 同帧共用一个焦距 -> 标量即可
-                #     is_right_list=[int(r) for r in all_right], # 0/1
-                #     axis='y-',
-                #     line_color=(0,0,255), thickness=2, alpha_value=1.0,
-                #     apply_x_flip=False, apply_rotx_180=False,
-                #     invert_x=False, invert_y=False,
-                #     ray_len=None,
-                #     fids=list(range(len(all_cam_t))),          # 与 out 的 batch 顺序一致
-                #     verts_list_preflipped=all_verts            # ★ 已取反的 verts，避免函数内重复取反
-                # )
+                
+                num_hands = len(all_cam_t)
+                if num_hands > 0:
+                    fids = list(range(num_hands))
+                    heat3d.decay_step()  # 每帧开始：遗忘一点
 
-                # from visualization.interaction_area import compute_interaction_region_from_overlay
-                # region_mask, heatmap, cnt = compute_interaction_region_from_overlay(overlay_ray)
-                # # 可视化：把区域半透明涂在当前帧上
-                # vis = img_cv2.copy()
-                # if cnt is not None:
-                #     cv2.drawContours(vis, [cnt], -1, (0, 255, 255), thickness=2)  # 画黄边
-                # # 叠加填充
-                # fill = np.zeros_like(img_cv2, np.uint8); fill[:] = (0, 255, 255)
-                # alpha = (region_mask.astype(np.float32)/255.0 * 0.35)[..., None]  # 35% 透明度
-                # vis = (fill.astype(np.float32)*alpha + vis.astype(np.float32)*(1-alpha)).astype(np.uint8)
-                # # 3) 叠加到原图 (alpha blend)
-                # mano_ray = img_cv2.copy()
-                # if mano_ray.shape[2] == 3:
-                #     alpha = overlay_ray[:, :, 3:4].astype(np.float32) / 255.0
-                #     fg = overlay_ray[:, :, :3].astype(np.float32)
-                #     mano_ray = (fg * alpha + mano_ray.astype(np.float32) * (1 - alpha)).astype(np.uint8)
+                    # 对每只手（与你多手循环一致）：
+                    #   先得到 O_cam, D_cam, V_cam, palm_center, palm_normal
+                    #   调用 update_with_rays 累积到热图
+                    for n in range(num_hands):
+                        cam_t_used = all_cam_t[n]
+                        is_right_n = int(all_right[n])
 
-                # from visualization.mano_joint_ray import compute_interaction_region_from_overlay_dir
-                # # 2) 方向约束 + 区域压缩（掌心前向 + 指尖锥体）
-                # region_mask = compute_interaction_region_from_overlay_dir(
-                #     overlay_ray,
-                #     out, model,
-                #     img_w=W, img_h=H,
-                #     cam_t_list=all_cam_t,
-                #     focal_length=float(scaled_focal),
-                #     is_right_list=[int(r) for r in all_right],
-                #     fids=list(range(len(all_cam_t))),
-                #     verts_list_preflipped=all_verts,
-                #     axis='y-',
-                #     apply_rotx_180=False, apply_x_flip=False,
-                #     expand_px=12,          # 射线带宽
-                #     theta_front_deg=70,    # 掌心前向阈
-                #     phi_finger_deg=35,     # 指尖锥体阈
-                #     min_area=300
-                # )
+                        O_cam, D_cam, V_cam, pc, pn = compute_mano_rays_in_cam(
+                            out, model, fid=fids[n], cam_t=cam_t_used, is_right_n=is_right_n,
+                            axis='y-', apply_rotx_180=False, exclude_kps={13,14,15}
+                        )
 
-                # 1) 生成射线 + 收集 2D 线段
-                overlay_ray, n, segments = compute_mano_joint_rays_mano_overlay_multi(
-                    out, model,
-                    img_w=W, img_h=H,
-                    cam_t_list=all_cam_t,
-                    focal_length=float(scaled_focal),
-                    is_right_list=[int(r) for r in all_right],
-                    axis='y-',
-                    line_color=(0,0,255), thickness=2, alpha_value=1.0,
-                    apply_x_flip=False, apply_rotx_180=False,
-                    invert_x=False, invert_y=False,
-                    ray_len=None,
-                    fids=list(range(len(all_cam_t))),
-                    verts_list_preflipped=all_verts,
-                    collect_segments=True,                 # ★ 开启收集线段
-                    # twist_kp_indices=(13,14,15),     # 若你的 thumb 索引不同，请据实调整
-                    twist_kp_indices=(13, 14, 15),     # 若你的 thumb 索引不同，请据实调整
-                    twist_deg=45.0          # 顺时针 45°（从根→尖看为顺时针）
-                )
-                # from visualization.mano_joint_ray import build_interaction_region_starconvex_robust 
-                from visualization.optim import build_interaction_region_starconvex_robust
-                # 2) 只沿射线“前向”扩张得到交互区域（不在手背方向扩张）
-                # region_mask, polys = build_interaction_region_starconvex(
-                #     segments,
-                #     img_shape=(H, W),
-                #     tips_only=True,             # 只用末节（默认不含 15）
-                #     exclude_kp={13,14,15},      # 继续排除大拇指
-                #     smooth_lambda=1.5,          # 半径平滑强度（越大越圆滑）
-                #     huber_delta=2.0,            # 稳健权阈值
-                #     irls_iters=5,
-                #     min_area=120,
-                #     close_ks=9
-                # )
-                region_mask, poly = build_interaction_region_starconvex_robust(
-                    segments,
-                    img_shape=(H, W),
-                    tips_only=True,
-                    exclude_kp={13,14,15},
-                    augment_k=2,        # 每条射线左右各加2个扇区
-                    delta_deg=20.0,
-                    anchor_mode='fraction',
-                    anchor_frac=0.85,
-                    anchor_weight=1.5,
-                    smooth_lambda=0.6,
-                    huber_delta=3.0,
-                    irls_iters=6,
-                    scale_prior_weight=0.5
+                        # 累积更新
+                        heat3d.update_with_rays(
+                            O_list=O_cam, D_list=D_cam, V_cam_for_bbox=V_cam,
+                            palm_center=pc, palm_normal=pn,
+                            prefer_dist=0.08, sigma_para=0.03,
+                            sigma_perp=0.0,                 # ★ 先关掉横向 splat
+                            step=None,                      # ★ 自适应，不会比体素更密
+                            alpha_hit=0.8, alpha_gate=0.5
+                        )
+
+                # 投影为 2D 叠加层（与 hand_silhouette_overlay 用同一内参）
+                fx = fy = float(scaled_focal); cx, cy = W/2.0, H/2.0
+                overlay_heat = heat3d.render_overlay(
+                    img_w=W, img_h=H, fx=fx, fy=fy, cx=cx, cy=cy,
+                    alpha=0.55, colormap=cv2.COLORMAP_JET, thresh=0.15
                 )
 
-                # 可视化叠加
-                mano_ray_direction = img_cv2.copy()
-                fill = np.zeros_like(mano_ray_direction); fill[:] = (0, 220, 255)
-                alpha = (region_mask.astype(np.float32)/255.0 * 0.35)[...,None]
-                mano_ray_direction = (fill.astype(np.float32)*alpha + mano_ray_direction.astype(np.float32)*(1-alpha)).astype(np.uint8)
-                if poly is not None:
-                    cv2.polylines(mano_ray_direction, [poly.reshape(-1,1,2).astype(np.int32)], True, (0,140,255), 2, cv2.LINE_AA)
+                # print(f"max:{overlay_heat.max()}, min:{overlay_heat.min()}")
 
-
+                # 叠加到原图
                 # mano_ray_direction = img_cv2.copy()
-                # fill = np.zeros_like(mano_ray_direction); fill[:] = (0,220,255)
-                # alpha = (region_mask.astype(np.float32)/255.0 * 0.35)[...,None]
-                # vis = (fill.astype(np.float32)*alpha + mano_ray_direction.astype(np.float32)*(1-alpha)).astype(np.uint8)
+                # if mano_ray_direction.shape[2] == 3:
+                #     a = overlay_heat[:, :, 3:4].astype(np.float32)
+                #     mano_ray_direction = (overlay_heat[:, :, :3].astype(np.float32) * a +
+                #         mano_ray_direction.astype(np.float32) * (1 - a)).astype(np.uint8)
 
-                # # （可选）画拟合多边形边界
-                # for hid, poly in (polys or {}).items():
-                #     pts = poly.reshape(-1,1,2).astype(np.int32)
-                #     cv2.polylines(mano_ray_direction, [pts], isClosed=True, color=(0,140,255), thickness=2, lineType=cv2.LINE_AA)
+                mano_ray_direction = overlay_heat * 255.0
 
+                mano_ray_direction = img_cv2.copy()
+                if mano_ray_direction.shape[2] == 3:
+                    a = overlay_heat[:, :, 3:4].astype(np.float32)
+                    fg = overlay_heat[:, :, :3].astype(np.float32)          # BGR
+                    bg = mano_ray_direction.astype(np.float32)
+                    mano_ray_direction = (fg * a + bg * (1 - a)).astype(np.uint8)
 
         # 计算推理时间(从开始推理到手模渲染完成)
         inference_time = time.time() - inference_start
@@ -563,7 +502,6 @@ def main():
 
         cv2.imshow('Hand Recon', overlay)  # hand 重建结果
         cv2.imshow('Detection Result', overlay_2dbbox)  # detection的2D包围盒
-        cv2.imshow('mano ray', mano_ray)
         cv2.imshow('interaction region', mano_ray_direction)
 
 
