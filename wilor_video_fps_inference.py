@@ -268,7 +268,7 @@ def main():
     start_time = time.time()
     perf_history = []
 
-    from visualization.optim import GraspVolumeHeatmap, compute_mano_rays_in_cam
+    from visualization.optim import GraspVolumeHeatmap, compute_mano_rays_in_cam, composite_overlay_enhanced
     heat3d = GraspVolumeHeatmap(
         voxel_size=0.01,   # 体素边长 ~1cm；若无尺度，用 bbox 尺度：把 0.01 改成 0.01*diag
         margin=0.06,
@@ -296,6 +296,7 @@ def main():
         overlay = img_cv2.copy()          # 手重建/叠加主图
         overlay_2dbbox = img_cv2.copy()   # 2D 检测框可视化
         mano_ray_direction = img_cv2.copy()
+        heat_img = img_cv2.copy()
         mesh_rendered = False             # 是否真的完成了重建/渲染
 
         current_time = time.time()
@@ -367,22 +368,6 @@ def main():
                             os.path.join(args.out_folder,
                                        f'{frame_id:06d}_{n}.obj'))
 
-            # if all_verts:
-            #     misc_args = dict(mesh_base_color=LIGHT_PURPLE,
-            #                 scene_bg_color=(1, 1, 1),
-            #                 focal_length=scaled_focal)
-            #     cam_view = renderer.render_rgba_multiple(
-            #         all_verts, cam_t=all_cam_t,
-            #         render_res=(img_cv2.shape[1], img_cv2.shape[0]),
-            #         is_right=all_right, **misc_args)
-
-            #     input_img = img_cv2.astype(np.float32)[..., ::-1] / 255.0
-            #     input_img = np.concatenate(
-            #         [input_img, np.ones_like(input_img[..., :1])], axis=2)
-            #     overlay = input_img[..., :3] * (1 - cam_view[..., 3:]) + \
-            #             cam_view[..., :3] * cam_view[..., 3:]
-            #     overlay = np.clip(overlay * 255, 0, 255).astype(np.uint8)
-            #     mesh_rendered = True
             
             if all_verts:
                 H, W = img_cv2.shape[0], img_cv2.shape[1]
@@ -452,30 +437,22 @@ def main():
                             alpha_hit=0.8, alpha_gate=0.5
                         )
 
-                # 投影为 2D 叠加层（与 hand_silhouette_overlay 用同一内参）
+
+                from visualization.optim import composite_overlay_conf_tricolor, render_heatmap_image_only, overlay_heat_on_image
                 fx = fy = float(scaled_focal); cx, cy = W/2.0, H/2.0
-                overlay_heat = heat3d.render_overlay(
-                    img_w=W, img_h=H, fx=fx, fy=fy, cx=cx, cy=cy,
-                    alpha=0.55, colormap=cv2.COLORMAP_JET, thresh=0.15
+                heat_img = render_heatmap_image_only(
+                    heat3d, img_w=W, img_h=H, fx=fx, fy=fy, cx=cx, cy=cy,
+                    gamma=0.85, block_px=12, blur_px=0,
+                    colormap=cv2.COLORMAP_PLASMA,  # 或 cv2.COLORMAP_TURBO
+                    draw_grid=True, grid_step=16, grid_color=(48,36,64), grid_alpha=0.28
                 )
 
-                # print(f"max:{overlay_heat.max()}, min:{overlay_heat.min()}")
-
-                # 叠加到原图
-                # mano_ray_direction = img_cv2.copy()
-                # if mano_ray_direction.shape[2] == 3:
-                #     a = overlay_heat[:, :, 3:4].astype(np.float32)
-                #     mano_ray_direction = (overlay_heat[:, :, :3].astype(np.float32) * a +
-                #         mano_ray_direction.astype(np.float32) * (1 - a)).astype(np.uint8)
-
-                mano_ray_direction = overlay_heat * 255.0
-
-                mano_ray_direction = img_cv2.copy()
-                if mano_ray_direction.shape[2] == 3:
-                    a = overlay_heat[:, :, 3:4].astype(np.float32)
-                    fg = overlay_heat[:, :, :3].astype(np.float32)          # BGR
-                    bg = mano_ray_direction.astype(np.float32)
-                    mano_ray_direction = (fg * a + bg * (1 - a)).astype(np.uint8)
+                
+                mano_ray_direction = overlay_heat_on_image(img_cv2, heat_img,
+                                                    min_intensity=10,
+                                                    alpha_gain=0.9,
+                                                    alpha_gamma=0.75,
+                                                    mode='screen')
 
         # 计算推理时间(从开始推理到手模渲染完成)
         inference_time = time.time() - inference_start
@@ -503,6 +480,7 @@ def main():
         cv2.imshow('Hand Recon', overlay)  # hand 重建结果
         cv2.imshow('Detection Result', overlay_2dbbox)  # detection的2D包围盒
         cv2.imshow('interaction region', mano_ray_direction)
+        cv2.imshow('heatmap only', heat_img)
 
 
         if args.save and writer is None:

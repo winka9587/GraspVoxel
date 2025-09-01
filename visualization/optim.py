@@ -1306,3 +1306,286 @@ def compute_mano_rays_in_cam(out, model, fid, cam_t, is_right_n=1, axis='y-',
     pn = pn / (np.linalg.norm(pn)+1e-12)
 
     return O_cam, D_cam, V_cam, pc, pn
+
+
+import numpy as np
+import cv2
+
+def composite_overlay_enhanced(bg_bgr_u8, overlay_rgba_u8,
+                               min_alpha=1,          # 仅对 alpha>=min_alpha 的像素叠加
+                               mode='screen',        # 'screen' | 'add' | 'normal'
+                               gain=1.35,            # 颜色增益（让热图更亮）
+                               alpha_gamma=0.75,     # alpha 伽马：<1 提升暗部
+                               add_glow=True, glow_ks=21, glow_gain=0.35,  # 光晕
+                               outline=False, outline_thr=20, outline_thickness=2):  # 橙色轮廓
+    """
+    更醒目的热图叠加：
+      - Screen/加法/普通三种模式（默认 Screen：亮处更亮）
+      - alpha 自适应（gamma）+ 仅对 alpha>=min_alpha 的像素叠加
+      - 可选光晕（Gaussian blur 的外沿）
+      - 可选橙色轮廓（强调高置信边缘）
+    """
+    H, W = bg_bgr_u8.shape[:2]
+    bg = bg_bgr_u8.astype(np.float32) / 255.0        # BGR ∈ [0,1]
+    fg = overlay_rgba_u8[..., :3].astype(np.float32) / 255.0
+    a  = overlay_rgba_u8[..., 3].astype(np.float32) / 255.0   # ∈[0,1]
+    mask = (overlay_rgba_u8[..., 3] >= int(min_alpha)).astype(np.float32)
+
+    # alpha 增强（更显眼）
+    a = (np.clip(a, 0, 1) ** float(alpha_gamma)) * mask
+
+    # 叠加模式
+    if mode == 'screen':
+        fg_eff = np.clip(fg * float(gain), 0.0, 1.0)
+        screen = 1.0 - (1.0 - bg) * (1.0 - fg_eff)          # Screen
+        base = bg * (1.0 - a[..., None]) + screen * a[..., None]
+    elif mode == 'add':
+        base = np.clip(bg + fg * (float(gain) * a[..., None]), 0.0, 1.0)
+    else:  # 'normal'：标准 alpha
+        base = fg * a[..., None] + bg * (1.0 - a[..., None])
+
+    # 光晕（可选）：用 alpha 扩散一圈，颜色取热图平均亮度
+    if add_glow and glow_ks > 1:
+        k = int(glow_ks) | 1
+        al = a.astype(np.float32)
+        glow = cv2.GaussianBlur(al, (k, k), 0)
+        glow = np.clip(glow - al, 0.0, 1.0) * float(glow_gain)   # 只保留外沿
+        glow_col = np.mean(fg, axis=2, keepdims=True)            # 单通道亮度作为颜色
+        base = np.clip(base + glow[..., None] * glow_col, 0.0, 1.0)
+
+    out = (base * 255.0 + 0.5).astype(np.uint8)
+
+    # 高置信轮廓（可选）
+    if outline and outline_thickness > 0:
+        m = (overlay_rgba_u8[..., 3] >= int(outline_thr)).astype(np.uint8) * 255
+        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            # 橙色（BGR = 0,165,255），加粗抗锯齿
+            cv2.polylines(out, [c], True, (0, 165, 255), int(outline_thickness), cv2.LINE_AA)
+
+    return out
+
+
+import numpy as np
+import cv2
+
+def composite_overlay_confidence_yellow(
+    bg_bgr_u8, overlay_rgba_u8,
+    min_alpha=1,                 # 仅在 alpha>=min_alpha 的像素处生效
+    yellow=(0, 255, 255),        # 目标颜色（BGR 的“黄”）
+    mode='screen',               # 'screen' | 'normal'
+    alpha_gamma=0.75,            # 置信度γ：<1 提升低值，让更显眼
+    gain=1.00,                   # 黄色强度增益
+    add_glow=True, glow_ks=21, glow_gain=0.35,  # 光晕
+    outline=False, outline_thr=32, outline_thickness=2
+):
+    """
+    用热图 alpha 当“置信度”，把背景往黄色推：
+      - conf = (alpha/255)^gamma
+      - 输出 = lerp(bg, screen(bg, yellow), conf)（或 normal)
+      - 只在 alpha>=min_alpha 的像素处叠加，其他保持原图
+    """
+    H, W = bg_bgr_u8.shape[:2]
+    bg = bg_bgr_u8.astype(np.float32) / 255.0
+    a  = overlay_rgba_u8[..., 3].astype(np.float32) / 255.0
+    mask = (overlay_rgba_u8[..., 3] >= int(min_alpha)).astype(np.float32)
+
+    # 置信度（带 γ）
+    conf = (np.clip(a, 0, 1) ** float(alpha_gamma)) * mask
+
+    # 目标黄色
+    ycol = (np.array(yellow, np.float32) / 255.0)[None, None, :] * float(gain)
+    ycol = np.clip(ycol, 0.0, 1.0)
+
+    # 计算“把背景往黄推”的目标图
+    if mode == 'screen':
+        # screen(bg, yellow)
+        tgt = 1.0 - (1.0 - bg) * (1.0 - ycol)
+        tgt = np.clip(tgt, 0.0, 1.0)
+    else:  # 'normal'：直接用黄
+        tgt = np.broadcast_to(ycol, bg.shape)
+
+    # 只在有置信度的像素处进行插值
+    out = bg * (1.0 - conf[..., None]) + tgt * conf[..., None]
+
+    # 光晕（用 conf 扩一圈）
+    if add_glow and glow_ks > 1:
+        k = int(glow_ks) | 1
+        c = conf.astype(np.float32)
+        g = cv2.GaussianBlur(c, (k, k), 0)
+        halo = np.clip(g - c, 0.0, 1.0) * float(glow_gain)
+        # 光晕颜色用浅黄
+        halo_col = np.array([[0, 220/255.0, 220/255.0]], np.float32)
+        out = np.clip(out + halo[..., None] * halo_col, 0.0, 1.0)
+
+    out_u8 = (out * 255.0 + 0.5).astype(np.uint8)
+
+    # 高置信轮廓（可选）
+    if outline and outline_thickness > 0:
+        m = (overlay_rgba_u8[..., 3] >= int(outline_thr)).astype(np.uint8) * 255
+        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            cv2.polylines(out_u8, [c], True, (0, 215, 255), int(outline_thickness), cv2.LINE_AA)
+
+    return out_u8
+
+
+import numpy as np
+import cv2
+
+def composite_overlay_conf_tricolor(
+    bg_bgr_u8, overlay_rgba_u8,
+    min_alpha=1,            # 仅对 alpha>=min_alpha 的像素叠加（uint8）
+    gamma=0.80,             # 置信度伽马（<1 提升暗部可见度）
+    alpha_gain=0.85,        # 叠加强度 = conf * alpha_gain
+    block_px=11,            # 把稀疏点膨胀成块（奇数，<=1 不膨胀）
+    blur_px=3               # 轻微模糊让块更自然（奇数，<=1 不模糊）
+):
+    """
+    overlay_rgba_u8 的 alpha 被视作置信度 conf∈[0,1]，按 0=黑, 低=蓝, 中=黄, 高=红 着色；
+    只对 conf>0 的区域叠加到 bg。
+    """
+    H, W = bg_bgr_u8.shape[:2]
+    bg = bg_bgr_u8.astype(np.float32) / 255.0
+
+    # 1) 置信度（来自 overlay alpha），可选伽马增强
+    conf = overlay_rgba_u8[..., 3].astype(np.float32) / 255.0
+    conf = np.power(np.clip(conf, 0, 1), float(gamma))
+
+    # 2) 放大为像素块（先膨胀，后可选模糊）
+    if block_px is not None and int(block_px) > 1:
+        k = int(block_px) | 1
+        conf_u8 = (conf * 255.0).astype(np.uint8)
+        conf_u8 = cv2.dilate(conf_u8, cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)), 1)
+        if blur_px is not None and int(blur_px) > 1:
+            bp = int(blur_px) | 1
+            conf_u8 = cv2.GaussianBlur(conf_u8, (bp, bp), 0)
+        conf = conf_u8.astype(np.float32) / 255.0
+
+    # 3) 分段线性着色：0→黑，低→蓝，中→黄，高→红（BGR）
+    #    断点可按需调整（这里设在 0, 0.33, 0.66, 1.0）
+    bp = np.array([0.0, 0.33, 0.66, 1.0], dtype=np.float32)
+    colors = np.array([
+        [0,   0,   0  ],   # 黑 (B,G,R)
+        [255, 0,   0  ],   # 蓝
+        [0,   255, 255],   # 黄
+        [0,   0,   255],   # 红
+    ], dtype=np.float32) / 255.0
+
+    # 每个像素所在区间
+    conf_clipped = np.clip(conf, 0, 1)
+    idx = np.clip(np.searchsorted(bp, conf_clipped, side='right') - 1, 0, len(bp)-2)
+    # 线性插值系数
+    t = (conf_clipped - bp[idx]) / (bp[idx+1] - bp[idx] + 1e-12)
+    # 取对应两端颜色并插值（逐像素）
+    c0 = colors[idx]             # (H,W,3)
+    c1 = colors[idx + 1]         # (H,W,3)
+    color = c0 * (1 - t[..., None]) + c1 * (t[..., None])
+
+    # 4) 只在 conf 超阈值的像素进行混合（标准 alpha：out = color*a + bg*(1-a)）
+    thr = float(min_alpha) / 255.0
+    a = conf * float(alpha_gain)
+    mask = (conf_clipped >= thr).astype(np.float32)[..., None]   # (H,W,1)
+    out = (color * a[..., None] + bg * (1.0 - a[..., None])) * mask + bg * (1.0 - mask)
+
+    return (np.clip(out, 0, 1) * 255.0 + 0.5).astype(np.uint8)
+
+
+def render_heatmap_image_only(heat3d,
+                              img_w, img_h, fx, fy, cx, cy,
+                              gamma=0.9,            # 伽马：<1 提升暗部
+                              block_px=12,          # 像素块膨胀（奇数）
+                              blur_px=0,            # 可选轻微模糊（奇数，0=不用）
+                              colormap=cv2.COLORMAP_PLASMA,  # 暗紫→黄→红
+                              draw_grid=True, grid_step=16, grid_color=(48, 36, 64), grid_alpha=0.28):
+    """
+    返回 (H,W,3) uint8 的纯 heatmap 可视化（BGR）。
+    - 使用体素最大投影；不做阈值，完整展示概率（更稳定）
+    - block_px 控制“像素块”效果；grid 可开网格线
+    """
+    # 1) 拿 3D 概率
+    p3 = heat3d.probability()
+    if p3 is None or float(p3.max()) <= 1e-8:
+        return np.zeros((img_h, img_w, 3), np.uint8)
+
+    # 2) 体素中心投影（不阈值，直接最大投影）
+    Z, Y, X = np.where(p3 > 0)
+    if len(Z) == 0:
+        return np.zeros((img_h, img_w, 3), np.uint8)
+
+    pts_xyz = np.stack([X, Y, Z], axis=1).astype(np.float64)
+    centers = heat3d.origin_xyz[None, :] + pts_xyz * heat3d.voxel_size
+
+    z = centers[:, 2]
+    u = np.round(fx * (centers[:, 0] / np.where(z > 1e-6, z, 1.0)) + cx).astype(np.int32)
+    v = np.round(fy * (centers[:, 1] / np.where(z > 1e-6, z, 1.0)) + cy).astype(np.int32)
+    m = (u >= 0) & (u < img_w) & (v >= 0) & (v < img_h) & (z > 1e-6)
+    if not np.any(m):
+        return np.zeros((img_h, img_w, 3), np.uint8)
+
+    u = u[m]; v = v[m]
+    val = p3[Z[m], Y[m], X[m]].astype(np.float32)
+
+    heat = np.zeros((img_h, img_w), np.float32)
+    np.maximum.at(heat, (v, u), val)  # 最大投影
+
+    # 3) 归一化 + 伽马
+    h = heat / (heat.max() + 1e-12)
+    if gamma is not None and gamma != 1.0:
+        h = np.power(np.clip(h, 0, 1), float(gamma))
+
+    # 4) 像素块膨胀 + 可选模糊
+    h8 = (np.clip(h, 0, 1) * 255).astype(np.uint8)
+    if block_px and int(block_px) > 1:
+        k = int(block_px) | 1
+        h8 = cv2.dilate(h8, cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)), 1)
+    if blur_px and int(blur_px) > 1:
+        bp = int(blur_px) | 1
+        h8 = cv2.GaussianBlur(h8, (bp, bp), 0)
+
+    # 5) 颜色映射（PLASMA：暗紫→黄→红）
+    color = cv2.applyColorMap(h8, colormap)  # BGR
+
+    # 6) 叠网格线（可选）
+    if draw_grid and grid_step >= 4:
+        grid = color.astype(np.float32) / 255.0
+        for x in range(0, img_w, int(grid_step)):
+            cv2.line(grid, (x, 0), (x, img_h-1), tuple(c/255.0 for c in grid_color), 1, cv2.LINE_AA)
+        for y in range(0, img_h, int(grid_step)):
+            cv2.line(grid, (0, y), (img_w-1, y), tuple(c/255.0 for c in grid_color), 1, cv2.LINE_AA)
+        color = np.clip(color * (1.0 - grid_alpha) + (grid * 255.0) * grid_alpha, 0, 255).astype(np.uint8)
+
+    return color
+
+
+import cv2
+import numpy as np
+
+def overlay_heat_on_image(bg_bgr_u8, heat_bgr_u8,
+                          min_intensity=8,   # 忽略很暗的热图像素(0-255)
+                          alpha_gain=0.85,   # 叠加强度
+                          alpha_gamma=0.80,  # 置信度γ(<1 提升暗部可见度)
+                          mode='screen'):    # 'screen' 更醒目；'normal' 普通混合
+    # 尺寸对齐
+    if bg_bgr_u8.shape[:2] != heat_bgr_u8.shape[:2]:
+        heat_bgr_u8 = cv2.resize(heat_bgr_u8, (bg_bgr_u8.shape[1], bg_bgr_u8.shape[0]),
+                                  interpolation=cv2.INTER_NEAREST)
+
+    bg = bg_bgr_u8.astype(np.float32) / 255.0
+    fg = heat_bgr_u8.astype(np.float32) / 255.0
+
+    # 用热图亮度作为 alpha（置信度）
+    gray = cv2.cvtColor(heat_bgr_u8, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    a = np.power(np.clip(gray, 0, 1), float(alpha_gamma)) * float(alpha_gain)
+
+    # 仅在亮度超过阈值时叠加
+    mask = (gray >= (min_intensity/255.0)).astype(np.float32)[..., None]
+    a = (a * mask[...,0])[..., None]  # (H,W,1)
+
+    if mode == 'screen':
+        screen = 1.0 - (1.0 - bg) * (1.0 - fg)  # 屏幕模式
+        out = bg * (1.0 - a) + screen * a
+    else:  # 'normal'
+        out = bg * (1.0 - a) + fg * a
+
+    return (np.clip(out, 0, 1) * 255.0 + 0.5).astype(np.uint8)
