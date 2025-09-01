@@ -20,15 +20,12 @@ from wilor.utils import recursive_to
 from wilor.datasets.vitdet_dataset import ViTDetDataset
 from wilor.utils.renderer import Renderer, cam_crop_to_full, RendererO3D
 from ultralytics import YOLO
-
-from visualization.mano_joint_ray import compute_mano_joint_rays_mano_overlay_multi
+from visualization.optim import GraspVolumeHeatmap, compute_mano_rays_in_cam
 
 LIGHT_PURPLE = (0.25098039, 0.274117647, 0.65882353)
 DISPLAY_COLOR = (0, 255, 0)  # 绿色显示性能信息
 
-import numpy as np
-import cv2
-from collections import defaultdict
+
 
 def temporal_smooth_heatmap(cur_heat_img_bgr, prev_heat_img_bgr,
                             min_alpha=0.60, max_alpha=0.95, adapt_scale=0.05):
@@ -295,7 +292,7 @@ def main():
     start_time = time.time()
     perf_history = []
 
-    from visualization.optim import GraspVolumeHeatmap, compute_mano_rays_in_cam, composite_overlay_enhanced
+    
     heat3d = GraspVolumeHeatmap(
         voxel_size=0.01,   # 体素边长 ~1cm；若无尺度，用 bbox 尺度：把 0.01 改成 0.01*diag
         margin=0.06,
@@ -466,7 +463,7 @@ def main():
                         )
 
 
-                from visualization.optim import composite_overlay_conf_tricolor, render_heatmap_image_only, overlay_heat_on_image
+                from visualization.optim import render_heatmap_image_only, overlay_heat_on_image
                 fx = fy = float(scaled_focal); cx, cy = W/2.0, H/2.0
                 heat_img = render_heatmap_image_only(
                     heat3d, img_w=W, img_h=H, fx=fx, fy=fy, cx=cx, cy=cy,
