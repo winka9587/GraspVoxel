@@ -256,6 +256,9 @@ def main():
     parser.add_argument('--save_mesh', action='store_true',
                       help='是否逐帧保存 hand mesh')
     parser.add_argument('--rescale_factor', type=float, default=2.0)
+    parser.add_argument('--heatmap_only', action='store_true',
+                    help='只渲染heatmap，跳过网格/轮廓/2D框/mesh导出等一切可视化')
+
     args = parser.parse_args()
 
     # ------------ 1. 模型加载 ------------
@@ -264,8 +267,12 @@ def main():
         checkpoint_path='./pretrained_models/wilor_final.ckpt',
         cfg_path='./pretrained_models/model_config.yaml')
     detector = YOLO('./pretrained_models/detector.pt')
-    # renderer = Renderer(cfg, faces=model.mano.faces)
-    renderer = RendererO3D(cfg, faces=model.mano.faces)
+
+    renderer = None
+    if not args.heatmap_only:
+        # renderer = Renderer(cfg, faces=model.mano.faces)
+        renderer = RendererO3D(cfg, faces=model.mano.faces)
+
     model = model.to(device).eval()
     detector = detector.to(device)
 
@@ -386,55 +393,58 @@ def main():
                     all_cam_t.append(cam_t)
                     all_right.append(is_right_n)
 
-                    if args.save_mesh:
-                        tmesh = renderer.vertices_to_trimesh(
-                            verts, cam_t, LIGHT_PURPLE, is_right=is_right_n)
-                        tmesh.export(
-                            os.path.join(args.out_folder,
-                                       f'{frame_id:06d}_{n}.obj'))
+                    if (not args.heatmap_only) and args.save_mesh:
+                        tmesh = renderer.vertices_to_trimesh(verts, cam_t, LIGHT_PURPLE, is_right=is_right_n)
+                        tmesh.export(os.path.join(args.out_folder, f'{frame_id:06d}_{n}.obj'))
 
             
             if all_verts:
                 H, W = img_cv2.shape[0], img_cv2.shape[1]
-                # 先把原图转到 RGBA，便于叠加
-                base_rgba = np.concatenate(
-                    [img_cv2[..., ::-1].astype(np.float32) / 255.0,
-                    np.ones((H, W, 1), dtype=np.float32)], axis=2)
+
+                if not args.heatmap_only:
+                    # 先把原图转到 RGBA，便于叠加
+                    base_rgba = np.concatenate(
+                        [img_cv2[..., ::-1].astype(np.float32) / 255.0,
+                        np.ones((H, W, 1), dtype=np.float32)], axis=2)
 
 
-                # 多只手的轮廓叠到同一张 overlay 上
-                overlay_rgba = np.zeros((H, W, 4), dtype=np.float32)
-                for verts, cam_t, right_flag in zip(all_verts, all_cam_t, all_right):
-                    rgba_i, _ = hand_silhouette_overlay(
-                        verts=verts,
-                        faces=model.mano.faces,   # 使用右手 faces；如果你有 faces_left 并想严格区分，可按 right_flag 选择
-                        cam_t=cam_t,
-                        img_w=W, img_h=H,
-                        focal_length=float(scaled_focal),
-                        is_right=int(right_flag),
-                        line_color=(0, 255, 0),
-                        thickness=2,
-                    )
-                    overlay_rgba += rgba_i.astype(np.float32) / 255.0  # 多个轮廓简单叠加（线不重合基本没问题）
+                    # 多只手的轮廓叠到同一张 overlay 上
+                    overlay_rgba = np.zeros((H, W, 4), dtype=np.float32)
+                    for verts, cam_t, right_flag in zip(all_verts, all_cam_t, all_right):
+                        rgba_i, _ = hand_silhouette_overlay(
+                            verts=verts,
+                            faces=model.mano.faces,   # 使用右手 faces；如果你有 faces_left 并想严格区分，可按 right_flag 选择
+                            cam_t=cam_t,
+                            img_w=W, img_h=H,
+                            focal_length=float(scaled_focal),
+                            is_right=int(right_flag),
+                            line_color=(0, 255, 0),
+                            thickness=2,
+                        )
+                        overlay_rgba += rgba_i.astype(np.float32) / 255.0  # 多个轮廓简单叠加（线不重合基本没问题）
 
-                # 裁剪 alpha 到 [0,1]
-                overlay_rgba = np.clip(overlay_rgba, 0.0, 1.0)
+                    # 裁剪 alpha 到 [0,1]
+                    overlay_rgba = np.clip(overlay_rgba, 0.0, 1.0)
 
-                # Alpha 合成到原图 (前景=overlay)
-                out_rgb = base_rgba[..., :3] * (1.0 - overlay_rgba[..., 3:]) + overlay_rgba[..., :3] * overlay_rgba[..., 3:]
-                # overlay = np.clip(out_rgb * 255, 0, 255).astype(np.uint8)[..., ::-1]  # 回到 BGR 给 OpenCV 显示
-                out_u8 = np.clip(out_rgb * 255, 0, 255).astype(np.uint8)   # 连续的 RGB uint8
-                overlay = np.ascontiguousarray(out_u8[..., ::-1])          # 变为 BGR，并确保连续
-                
-                # 绘制2D包围盒
-                print("detections.boxes.xyxy:", detections.boxes.xyxy)
-                overlay_bbox = draw_2d_bbox(base_rgba, detections.boxes.xyxy, color=(0,1,0), alpha=0.6)
-                out_rgb_bbox = base_rgba[..., :3] * (1.0 - overlay_bbox[..., 3:]) + overlay_bbox[..., :3] * overlay_bbox[..., 3:]
-                out_u8_bbox = np.clip(out_rgb_bbox * 255, 0, 255).astype(np.uint8)
-                overlay_2dbbox = np.ascontiguousarray(out_u8_bbox[..., ::-1])
-                mesh_rendered = True
+                    # Alpha 合成到原图 (前景=overlay)
+                    out_rgb = base_rgba[..., :3] * (1.0 - overlay_rgba[..., 3:]) + overlay_rgba[..., :3] * overlay_rgba[..., 3:]
+                    # overlay = np.clip(out_rgb * 255, 0, 255).astype(np.uint8)[..., ::-1]  # 回到 BGR 给 OpenCV 显示
+                    out_u8 = np.clip(out_rgb * 255, 0, 255).astype(np.uint8)   # 连续的 RGB uint8
+                    overlay = np.ascontiguousarray(out_u8[..., ::-1])          # 变为 BGR，并确保连续
+                    
+                    # 绘制2D包围盒
+                    print("detections.boxes.xyxy:", detections.boxes.xyxy)
+                    overlay_bbox = draw_2d_bbox(base_rgba, detections.boxes.xyxy, color=(0,1,0), alpha=0.6)
+                    out_rgb_bbox = base_rgba[..., :3] * (1.0 - overlay_bbox[..., 3:]) + overlay_bbox[..., :3] * overlay_bbox[..., 3:]
+                    out_u8_bbox = np.clip(out_rgb_bbox * 255, 0, 255).astype(np.uint8)
+                    overlay_2dbbox = np.ascontiguousarray(out_u8_bbox[..., ::-1])
+                else:
+                    # heatmap-only 模式下，只保留原图作为底图或干脆不显示该窗口
+                    overlay = img_cv2  # 也可以不显示 'Hand Recon' 窗口
+                    overlay_2dbbox = img_cv2
 
-                
+
+                mesh_rendered = True  # 仍可用于统计耗时
                 num_hands = len(all_cam_t)
                 if num_hands > 0:
                     fids = list(range(num_hands))
@@ -509,8 +519,9 @@ def main():
         # 在图像上绘制性能信息
         draw_perf_info(overlay, avg_inference_time, avg_fps, perf_history)
 
-        cv2.imshow('Hand Recon', overlay)  # hand 重建结果
-        cv2.imshow('Detection Result', overlay_2dbbox)  # detection的2D包围盒
+        if not args.heatmap_only:
+            cv2.imshow('Hand Recon', overlay)  # hand 重建结果
+            cv2.imshow('Detection Result', overlay_2dbbox)  # detection的2D包围盒
         cv2.imshow('interaction region', mano_ray_direction)
         cv2.imshow('heatmap only', heat_img)
 
