@@ -30,6 +30,33 @@ import numpy as np
 import cv2
 from collections import defaultdict
 
+def temporal_smooth_heatmap(cur_heat_img_bgr, prev_heat_img_bgr,
+                            min_alpha=0.60, max_alpha=0.95, adapt_scale=0.05):
+    """
+    对彩色热图做自适应 EMA:
+      out = alpha * prev + (1 - alpha) * cur
+    其中 alpha ∈ [min_alpha, max_alpha]，随帧间差异自适应变化。
+    """
+    cur = cur_heat_img_bgr.astype(np.float32)
+    if prev_heat_img_bgr is None:
+        return cur.astype(np.uint8), cur  # 首帧直接通过
+
+    prev = prev_heat_img_bgr.astype(np.float32)
+
+    # 用平均像素差估计帧间变化（0..1）
+    diff = np.mean(np.abs(cur - prev)) / 255.0
+    # 差异越小 -> alpha 越大（更平滑）；差异大 -> alpha 降低（减少拖影）
+    alpha = min_alpha + (max_alpha - min_alpha) * np.exp(-diff / max(adapt_scale, 1e-6))
+    alpha = float(np.clip(alpha, min_alpha, max_alpha))
+
+    smoothed = alpha * prev + (1.0 - alpha) * cur
+
+    # 可选：轻微空间去噪（极小高斯核），进一步抑制抖动
+    smoothed = cv2.GaussianBlur(smoothed, (0, 0), 0.6)
+
+    return smoothed.astype(np.uint8), smoothed  # 第二个返回 float32 作为下次的 prev
+
+
 # 绘制2D包围盒
 def draw_2d_bbox(base_rgba: np.ndarray, boxes: torch.Tensor, color=(1.0, 0.0, 0.0), alpha=0.5, thickness=2):
     """
@@ -275,6 +302,7 @@ def main():
         decay=0.98
     )
 
+    prev_heat_img_state = None
     resize_target = 640.0
     while True:
         ok, img_cv2 = cap.read()
@@ -445,6 +473,13 @@ def main():
                     gamma=0.85, block_px=12, blur_px=0,
                     colormap=cv2.COLORMAP_PLASMA,  # 或 cv2.COLORMAP_TURBO
                     draw_grid=True, grid_step=16, grid_color=(48,36,64), grid_alpha=0.28
+                )
+
+                heat_img, prev_heat_img_state = temporal_smooth_heatmap(
+                    heat_img, prev_heat_img_state,
+                    min_alpha=0.60,   # 越接近 1 越平滑
+                    max_alpha=0.95,   # 上限；可调到 0.98 更稳
+                    adapt_scale=0.05  # 帧间差异的“灵敏度”，越小越敏感
                 )
 
                 
