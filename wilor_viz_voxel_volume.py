@@ -636,6 +636,7 @@ def main():
                     out, model, fid=fid, cam_t=cam_t_used, is_right_n=is_right_n,
                     axis='y-', apply_rotx_180=False, exclude_kps={13, 14, 15}
                 )
+                print(f"O_cam: {O_cam}, D_cam: {D_cam}")
                 heat3d.update_with_rays(
                     O_list=O_cam, D_list=D_cam, V_cam_for_bbox=V_cam,
                     palm_center=pc, palm_normal=pn,

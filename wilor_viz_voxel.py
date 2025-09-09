@@ -51,7 +51,7 @@ def extract_prob_and_grid(heat3d):
     return p3, vox, origin
 
 
-def filter_active_voxels(p3, mode="quantile", thresh=0.20, q=90.0, cap=5000, min_keep=300):
+def filter_active_voxels(p3, mode="quantile", thresh=0.20, q=90.0, cap=5000, min_keep=0):
     """
     过滤要画的体素索引：
       - mode="quantile" -> 取>=百分位(q) 与 >=thresh 的较高者
@@ -342,9 +342,9 @@ class SimpleHandAndVoxelsVis:
         self.voxels = o3d.geometry.TriangleMesh()
         self.lines = o3d.geometry.LineSet()
 
-        self.vis.add_geometry(self.hand)
-        self.vis.add_geometry(self.voxels)
-        self.vis.add_geometry(self.lines)
+        self.vis.add_geometry(self.hand, reset_bounding_box=True)
+        self.vis.add_geometry(self.voxels, reset_bounding_box=True)
+        self.vis.add_geometry(self.lines, reset_bounding_box=True)
 
         axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.05)
         self.vis.add_geometry(axis)
@@ -357,8 +357,8 @@ class SimpleHandAndVoxelsVis:
         vc = self.vis.get_view_control()
         vc.set_front([0.0, 0.0, -1.0])
         vc.set_up([0.0, -1.0, 0.0])
-        vc.set_lookat([0.0, 0.0, 0.0])
-        vc.set_zoom(5)
+        vc.set_lookat([10.0, 0.0, 0.0])
+        vc.set_zoom(10)
 
         self._cam_template = vc.convert_to_pinhole_camera_parameters()
 
@@ -406,11 +406,11 @@ class SimpleHandAndVoxelsVis:
             return  # ★ 不加空几何，避免 AABB 警告
 
         try:
-            self.vis.remove_geometry(self.hand, reset_bounding_box=False)
+            self.vis.remove_geometry(self.hand, reset_bounding_box=True)
         except Exception:
             pass
         self.hand = merged
-        self.vis.add_geometry(self.hand)
+        self.vis.add_geometry(self.hand, reset_bounding_box=True)
         self._restore_cam()
         self.vis.poll_events()
         self.vis.update_renderer()
@@ -486,11 +486,11 @@ class SimpleHandAndVoxelsVis:
 
         # 面
         try:
-            self.vis.remove_geometry(self.voxels, reset_bounding_box=False)
+            self.vis.remove_geometry(self.voxels, reset_bounding_box=True)
         except Exception:
             pass
         self.voxels = all_mesh
-        self.vis.add_geometry(self.voxels)
+        self.vis.add_geometry(self.voxels, reset_bounding_box=True)
 
         # 线
         if lines_pts:
@@ -501,11 +501,11 @@ class SimpleHandAndVoxelsVis:
                 np.tile(np.array([[0,0,0]], dtype=np.float64), (len(ls.lines), 1))
             )
             try:
-                self.vis.remove_geometry(self.lines, reset_bounding_box=False)
+                self.vis.remove_geometry(self.lines, reset_bounding_box=True)
             except Exception:
                 pass
             self.lines = ls
-            self.vis.add_geometry(self.lines)
+            self.vis.add_geometry(self.lines, reset_bounding_box=True)
 
         self._restore_cam()
         self.vis.poll_events()
@@ -578,8 +578,8 @@ def main():
                         help='禁用 Open3D 3D 可视化（仅 2D 输出）')
     parser.add_argument('--voxel_mode', type=str, default='quantile',
                         choices=['quantile', 'thresh'])
-    parser.add_argument('--voxel_thresh', type=float, default=0.20)
-    parser.add_argument('--voxel_q', type=float, default=90.0)
+    parser.add_argument('--voxel_thresh', type=float, default=0.80)
+    parser.add_argument('--voxel_q', type=float, default=10.0)
     parser.add_argument('--voxel_cap', type=int, default=5000)
 
     args = parser.parse_args()
@@ -878,8 +878,16 @@ def main():
                         V0 = np.asarray(all_verts[0], np.float64)
                         T0 = np.asarray(all_cam_t[0], np.float64).reshape(3)
                         wrist_cam = (Jr @ V0)[0] + T0           # 相机坐标下的手腕
-                        off = -wrist_cam                        # 让手腕到原点
+
+                        # 目标：让手腕在“可视化坐标”落到 (10, 0, 0)
+                        target_vis = np.array([10.0, 0.0, 0.0], dtype=np.float64)
+                        # 因为后面有 (V_cam + off) * VIS_SCALE，所以这里要先把目标除以 VIS_SCALE
+                        off = (target_vis / float(VIS_SCALE)) - wrist_cam
                         off = off.astype(np.float64)
+
+                        # # 让手腕到原点
+                        # off = -wrist_cam              
+                        # off = off.astype(np.float64)
 
                         # 3) 手：统一做一次变换 -> (V + T + off) * VIS_SCALE
                         verts_list_cam = []
@@ -892,7 +900,7 @@ def main():
                         p3, voxel_size, origin = extract_prob_and_grid(heat3d)
                         idxs = filter_active_voxels(
                             p3, mode=args.voxel_mode, thresh=args.voxel_thresh,
-                            q=args.voxel_q, cap=args.voxel_cap, min_keep=300
+                            q=args.voxel_q, cap=args.voxel_cap, min_keep=0
                         )
                         if idxs is not None and len(idxs) > 0:
                             origin_vis = (np.asarray(origin, np.float64) + off) * VIS_SCALE
