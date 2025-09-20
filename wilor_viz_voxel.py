@@ -913,8 +913,8 @@ def main():
                         if verts_list_cam and len(verts_list_cam[0]) > 0:
                             vis.update_hand(verts_list_cam, offset=None)
 
-                        if origin_vis is not None and voxel_size_vis is not None and len(idxs) > 0:
-                            vis.update_voxels(p3, idxs, voxel_size_vis, origin_vis, offset=None)
+                        # if origin_vis is not None and voxel_size_vis is not None and len(idxs) > 0:
+                        #     vis.update_voxels(p3, idxs, voxel_size_vis, origin_vis, offset=None)
 
                 except Exception as e:
                     print(f"[WARN] Open3D update failed: {e}")
